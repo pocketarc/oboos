@@ -1,0 +1,8 @@
+[package]
+name = "oboos-kernel"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+limine = "0.5"
+spin = "0.9"
