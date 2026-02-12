@@ -1,27 +1,10 @@
 use crate::platform::SerialConsole;
+use super::port::{inb, outb};
 
 // COM1 base I/O port address. This has been 0x3F8 since the original IBM PC.
 const COM1: u16 = 0x3F8;
 
 pub struct Serial;
-
-/* Raw x86 port I/O. These are privileged instructions — they only work in
- * ring 0 (kernel mode). That's why userspace programs can't just talk to
- * hardware directly, they are not running in the same privilege level as the kernel.
- */
-unsafe fn outb(port: u16, value: u8) {
-    unsafe {
-        core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack));
-    }
-}
-
-unsafe fn inb(port: u16) -> u8 {
-    let value: u8;
-    unsafe {
-        core::arch::asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack));
-    }
-    value
-}
 
 impl SerialConsole for Serial {
     /* Initialize the UART. This follows the standard 16550 UART programming

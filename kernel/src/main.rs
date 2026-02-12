@@ -2,6 +2,7 @@
 #![no_main] // No C runtime, no normal main(). We define our own entry point.
 
 mod arch;
+mod framebuffer;
 mod platform;
 
 use platform::Platform;
@@ -15,8 +16,8 @@ use platform::Platform;
  * avoids needing any runtime negotiation.
 */
 
-use limine::BaseRevision;
 use limine::request::{FramebufferRequest, RequestsEndMarker, RequestsStartMarker};
+use limine::BaseRevision;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -75,52 +76,55 @@ extern "C" fn kmain() -> ! {
     println!("=========================");
     println!();
 
-    // Try to paint the framebuffer as proof of life on the QEMU display.
+    // Paint the framebuffer and draw text as proof of life on the QEMU display.
     if let Some(response) = FRAMEBUFFER.get_response() {
         if let Some(fb) = response.framebuffers().next() {
-            paint_framebuffer(&fb);
-            println!(
-                "[ok] Framebuffer: {}x{}, {} bpp",
-                fb.width(),
-                fb.height(),
-                fb.bpp()
-            );
+            let ptr = fb.addr() as *mut u8;
+            let w = fb.width() as usize;
+            let h = fb.height() as usize;
+            let pitch = fb.pitch() as usize;
+
+            println!("[ok] Framebuffer: {}x{}, {} bpp", w, h, fb.bpp());
+
+            draw_splash(ptr, w, h, pitch, framebuffer::Color::DARK_BLUE);
+            println!("[ok] Press Enter to randomize colors!");
+
+            // Poll keyboard in a loop. When Enter is pressed, pick a new
+            // background color using the CPU cycle counter as entropy.
+            loop {
+                if let Some(scancode) = arch::x86_64::keyboard::poll_scancode() {
+                    // Only act on key press (make code), ignore release (0x80+).
+                    if scancode == arch::x86_64::keyboard::SC_ENTER {
+                        let tsc = arch::x86_64::read_tsc();
+                        let bg = framebuffer::Color((tsc & 0x00FFFFFF) as u32);
+                        draw_splash(ptr, w, h, pitch, bg);
+                        println!("[ok] Color: #{:06X}", bg.0);
+                    }
+                }
+            }
         }
     }
 
-    println!();
-    println!("Kernel initialized. Halting.");
-
-    // Nothing left to do — halt the CPU in a loop.
-    // The loop is necessary because interrupts (which we haven't set up yet)
-    // would wake us from hlt, and we'd need to halt again.
+    println!("No framebuffer available. Halting.");
     loop {
         arch::X86_64::halt_until_interrupt();
     }
 }
 
-// Fill the framebuffer with a deep blue color.
-fn paint_framebuffer(fb: &limine::framebuffer::Framebuffer) {
-    let width = fb.width() as usize;
-    let height = fb.height() as usize;
-    let pitch = fb.pitch() as usize; // bytes per row (may include padding)
-    let bpp = fb.bpp() as usize;
-    let bytes_per_pixel = bpp / 8;
+fn draw_splash(ptr: *mut u8, w: usize, h: usize, pitch: usize, bg: framebuffer::Color) {
+    framebuffer::clear(ptr, w, h, pitch, bg);
 
-    let fb_ptr = fb.addr() as *mut u8;
+    let title = "OBOOS v0.0";
+    let subtitle = "Off By One Operating System";
+    let hint = "Press Enter to change colors";
+    let title_x = (w - title.len() * 8) / 2;
+    let subtitle_x = (w - subtitle.len() * 8) / 2;
+    let hint_x = (w - hint.len() * 8) / 2;
+    let center_y = h / 2 - 16;
 
-    // Dark blue: R=0x1A, G=0x1A, B=0x2E (assumes 32-bit BGRA or BGRX layout)
-    for y in 0..height {
-        for x in 0..width {
-            let offset = y * pitch + x * bytes_per_pixel;
-            unsafe {
-                // BGRA byte order (standard for most framebuffers)
-                *fb_ptr.add(offset) = 0x2E; // Blue
-                *fb_ptr.add(offset + 1) = 0x1A; // Green
-                *fb_ptr.add(offset + 2) = 0x1A; // Red
-            }
-        }
-    }
+    framebuffer::draw_str(ptr, pitch, title_x, center_y, title, framebuffer::Color::WHITE);
+    framebuffer::draw_str(ptr, pitch, subtitle_x, center_y + 16, subtitle, framebuffer::Color::LIGHT_GRAY);
+    framebuffer::draw_str(ptr, pitch, hint_x, center_y + 40, hint, framebuffer::Color::LIGHT_GRAY);
 }
 
 /*
