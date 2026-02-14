@@ -1,9 +1,8 @@
-/*
- * Conditionally compiles the correct architecture module.
- * The kernel uses `arch::*` everywhere — it never knows which
- * architecture is underneath. Adding aarch64 later means adding
- * another pair of cfg lines and implementing the same types.
- */
+//! Architecture-specific code.
+//!
+//! Conditionally compiles the correct module and re-exports its types.
+//! The kernel uses `arch::*` everywhere — adding aarch64 later means
+//! adding another pair of cfg lines and implementing the same traits.
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;

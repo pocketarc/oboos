@@ -1,3 +1,8 @@
+//! OBOOS — Off By One Operating System.
+//!
+//! A from-scratch, Rust-based OS built for learning. Boots via the Limine
+//! protocol, targets x86_64 first, with a HAL designed for adding aarch64 later.
+
 #![no_std] // No standard library — we ARE the operating system.
 #![no_main] // No C runtime, no normal main(). We define our own entry point.
 
@@ -7,14 +12,12 @@ mod platform;
 
 use platform::Platform;
 
-/* ---------------------------------------------------------------------------
- * Limine boot protocol requests.
- *
- * These are static structs with magic numbers baked in. The bootloader scans
- * our binary for these markers, processes the requests, and fills in response
- * pointers before jumping to our entry point. It's a clever handshake that
- * avoids needing any runtime negotiation.
-*/
+// Limine boot protocol requests.
+//
+// These are static structs with magic numbers baked in. The bootloader scans
+// our binary for these markers, processes the requests, and fills in response
+// pointers before jumping to our entry point. It's a clever handshake that
+// avoids needing any runtime negotiation.
 
 use limine::request::{FramebufferRequest, RequestsEndMarker, RequestsStartMarker};
 use limine::BaseRevision;
@@ -35,12 +38,10 @@ static FRAMEBUFFER: FramebufferRequest = FramebufferRequest::new();
 #[unsafe(link_section = ".requests_end_marker")]
 static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
-/*
- * print! / println! macros — the first thing any OS needs.
- * These route through the serial port so output appears in the terminal
- * running QEMU (via -serial stdio).
- */
-
+/// Formatted printing to the serial console.
+///
+/// Routes through the serial port so output appears in the terminal
+/// running QEMU (via `-serial stdio`).
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {{
@@ -49,6 +50,7 @@ macro_rules! print {
     }};
 }
 
+/// Like [`print!`], but appends a newline.
 #[macro_export]
 macro_rules! println {
     () => { $crate::print!("\n") };
@@ -58,10 +60,7 @@ macro_rules! println {
     }};
 }
 
-/*
- * Kernel entry point — where the bootloader jumps to.
- */
-
+/// Kernel entry point — where the bootloader jumps to.
 #[unsafe(no_mangle)]
 extern "C" fn kmain() -> ! {
     // Initialize the platform (serial port, etc.)
@@ -111,6 +110,7 @@ extern "C" fn kmain() -> ! {
     }
 }
 
+// Paint the splash screen: solid background with centered title text.
 fn draw_splash(ptr: *mut u8, w: usize, h: usize, pitch: usize, bg: framebuffer::Color) {
     framebuffer::clear(ptr, w, h, pitch, bg);
 
@@ -127,11 +127,9 @@ fn draw_splash(ptr: *mut u8, w: usize, h: usize, pitch: usize, bg: framebuffer::
     framebuffer::draw_str(ptr, pitch, hint_x, center_y + 40, hint, framebuffer::Color::LIGHT_GRAY);
 }
 
-/*
- * Panic handler — required by #![no_std].
- * When the kernel panics, print the message and halt forever.
- */
-
+/// Panic handler — required by `#![no_std]`.
+///
+/// Prints the panic message to serial and halts forever.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     println!();

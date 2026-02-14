@@ -1,15 +1,17 @@
+//! 16550 UART serial driver on COM1.
+
 use crate::platform::SerialConsole;
 use super::port::{inb, outb};
 
-// COM1 base I/O port address. This has been 0x3F8 since the original IBM PC.
+// COM1 base I/O port address. Unchanged since the original IBM PC.
 const COM1: u16 = 0x3F8;
 
+/// Serial port driver.
 pub struct Serial;
 
 impl SerialConsole for Serial {
-    /* Initialize the UART. This follows the standard 16550 UART programming
-     * sequence that's been the same since the 1980s.
-     */
+    /// Initialize the UART following the standard 16550 programming sequence
+    /// that's been the same since the 1980s.
     fn init() {
         unsafe {
             outb(COM1 + 1, 0x00); // Disable all interrupts
@@ -22,6 +24,9 @@ impl SerialConsole for Serial {
         }
     }
 
+    /// Send a single byte out the serial port. Spins until the transmit
+    /// holding register is empty — safe at our throughput, but a real
+    /// driver would use interrupts to avoid busy-waiting.
     fn write_byte(b: u8) {
         unsafe {
             // Spin until the transmit holding register is empty.
@@ -31,6 +36,8 @@ impl SerialConsole for Serial {
         }
     }
 
+    /// Non-blocking read. Returns `Some(byte)` if data is waiting in the
+    /// receive buffer, `None` otherwise.
     fn read_byte() -> Option<u8> {
         unsafe {
             // Bit 0 of LSR = data ready
@@ -43,7 +50,9 @@ impl SerialConsole for Serial {
     }
 }
 
-// Allows using `write!` / `writeln!` with the serial port.
+/// Implements [`core::fmt::Write`] so we can use `write!` / `writeln!`
+/// with the serial port. This is what makes our `print!` and `println!`
+/// macros work.
 impl core::fmt::Write for Serial {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for b in s.bytes() {
