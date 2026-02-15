@@ -39,7 +39,7 @@
 //! Invalid TSS (10), Segment Not Present (11), Stack Segment Fault (12),
 //! General Protection Fault (13), Page Fault (14), Alignment Check (17).
 
-use super::gdt;
+use super::{gdt, pic};
 use core::mem::size_of;
 
 // ————————————————————————————————————————————————————————————————————————————
@@ -161,6 +161,86 @@ struct IdtRegister {
     /// Virtual address of the first entry.
     base: u64,
 }
+
+// ————————————————————————————————————————————————————————————————————————————
+// IRQ handler table
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Registered handlers for hardware IRQs 0–15.
+///
+/// Each slot holds an optional function pointer. When a hardware interrupt
+/// fires, the corresponding IRQ stub below checks this table and calls the
+/// handler if one is registered. `None` means nobody has claimed that IRQ
+/// yet — we just acknowledge it and move on.
+///
+/// This is `static mut` because it's written during driver initialization
+/// (single-threaded, interrupts disabled) and read from interrupt handlers
+/// (which can't race with each other since our interrupt gates disable IF).
+static mut IRQ_HANDLERS: [Option<fn()>; 16] = [None; 16];
+
+/// Register a handler for a hardware IRQ and enable that IRQ line.
+///
+/// After this call, the PIC will deliver interrupts for the given IRQ,
+/// and our IDT stub will call `handler` each time it fires.
+///
+/// # Panics
+///
+/// Panics if `irq` is not in 0–15.
+pub fn set_irq_handler(irq: u8, handler: fn()) {
+    assert!(irq < 16, "IRQ number must be 0-15, got {}", irq);
+    unsafe {
+        IRQ_HANDLERS[irq as usize] = Some(handler);
+    }
+    pic::unmask(irq);
+}
+
+/// Generate 16 IRQ handler stubs — one per hardware interrupt line.
+///
+/// Each stub is an `extern "x86-interrupt"` function that:
+/// 1. Looks up the registered handler in [`IRQ_HANDLERS`]
+/// 2. Calls it if present (otherwise the IRQ is silently ignored)
+/// 3. Sends EOI to the PIC so it will deliver the next interrupt
+///
+/// We use a macro because the only difference between the 16 handlers is
+/// the IRQ number, and writing them by hand would be tedious and error-prone.
+macro_rules! irq_handler {
+    ($name:ident, $irq:expr) => {
+        extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
+            unsafe {
+                if let Some(handler) = IRQ_HANDLERS[$irq] {
+                    handler();
+                }
+            }
+            pic::acknowledge($irq);
+        }
+    };
+}
+
+irq_handler!(irq_handler_0,  0);
+irq_handler!(irq_handler_1,  1);
+irq_handler!(irq_handler_2,  2);
+irq_handler!(irq_handler_3,  3);
+irq_handler!(irq_handler_4,  4);
+irq_handler!(irq_handler_5,  5);
+irq_handler!(irq_handler_6,  6);
+irq_handler!(irq_handler_7,  7);
+irq_handler!(irq_handler_8,  8);
+irq_handler!(irq_handler_9,  9);
+irq_handler!(irq_handler_10, 10);
+irq_handler!(irq_handler_11, 11);
+irq_handler!(irq_handler_12, 12);
+irq_handler!(irq_handler_13, 13);
+irq_handler!(irq_handler_14, 14);
+irq_handler!(irq_handler_15, 15);
+
+/// All 16 IRQ handler function pointers, indexed by IRQ number.
+/// Used during IDT setup to register vectors 32–47.
+const IRQ_STUBS: [extern "x86-interrupt" fn(InterruptStackFrame); 16] = [
+    irq_handler_0,  irq_handler_1,  irq_handler_2,  irq_handler_3,
+    irq_handler_4,  irq_handler_5,  irq_handler_6,  irq_handler_7,
+    irq_handler_8,  irq_handler_9,  irq_handler_10, irq_handler_11,
+    irq_handler_12, irq_handler_13, irq_handler_14, irq_handler_15,
+];
 
 // ————————————————————————————————————————————————————————————————————————————
 // Exception handlers
@@ -341,6 +421,14 @@ pub fn init() {
         // Vector 14: Page Fault — has error code, no IST
         (*idt)[14] = IdtEntry::new(page_fault_handler as *const () as u64, 0);
 
+        // Vectors 32–47: Hardware IRQ handlers (one per PIC line).
+        // These are registered now but won't fire until the PIC is
+        // initialized and individual IRQs are unmasked by device drivers.
+        for i in 0..16u8 {
+            let vector = (pic::IRQ_BASE + i) as usize;
+            (*idt)[vector] = IdtEntry::new(IRQ_STUBS[i as usize] as *const () as u64, 0);
+        }
+
         // Load the IDT register — same pattern as lgdt in gdt.rs.
         let idtr = IdtRegister {
             limit: (size_of::<[IdtEntry; 256]>() - 1) as u16,
@@ -350,5 +438,10 @@ pub fn init() {
         core::arch::asm!("lidt [{}]", in(reg) &idtr, options(readonly, nostack, preserves_flags));
     }
 
-    crate::println!("[ok] IDT loaded (6 exception handlers)");
+    crate::println!("[ok] IDT loaded (6 exception handlers, 16 IRQ vectors)");
+
+    // Now that the IDT has entries for vectors 32–47, remap the PIC so
+    // hardware IRQs actually route to those vectors instead of colliding
+    // with CPU exceptions.
+    pic::init();
 }
