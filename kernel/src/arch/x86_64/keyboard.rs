@@ -16,6 +16,7 @@ const STATUS_PORT: u16 = 0x64;
 // These are "make codes" (key press). Release codes are make + 0x80.
 const SC_ENTER: u8 = 0x1C;
 const SC_F: u8 = 0x21;
+const SC_T: u8 = 0x14;
 
 /// PS/2 keyboard driver — translates hardware scancodes into [`Key`] values.
 pub struct Ps2Keyboard;
@@ -51,6 +52,7 @@ impl Keyboard for Ps2Keyboard {
         let key = match scancode {
             SC_ENTER => Key::Enter,
             SC_F => Key::F,
+            SC_T => Key::T,
             other => Key::Other(other),
         };
         Some(key)

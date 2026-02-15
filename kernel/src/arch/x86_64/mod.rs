@@ -4,6 +4,7 @@ pub mod gdt;
 pub mod interrupts;
 pub mod keyboard;
 pub mod pic;
+pub mod pit;
 pub mod port;
 pub mod serial;
 
@@ -25,6 +26,13 @@ impl Platform for X86_64 {
         serial::Serial::init();
         gdt::init();
         interrupts::init();
+
+        // Program the PIT for 1 kHz, then register its tick handler.
+        // This order matters: configure the hardware before unmasking
+        // its IRQ, so we don't get an interrupt before we're ready.
+        pit::init(1000);
+        interrupts::set_irq_handler(0, pit::tick);
+
         X86_64
     }
 

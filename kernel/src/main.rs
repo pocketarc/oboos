@@ -86,19 +86,27 @@ extern "C" fn kmain() -> ! {
 
             println!("[ok] Framebuffer: {}x{}, {} bpp", w, h, fb.bpp());
 
-            draw_splash(ptr, w, h, pitch, framebuffer::Color::DARK_BLUE);
+            draw_splash(ptr, w, h, pitch, framebuffer::Color::DARK_BLUE, None);
             println!("[ok] Press Enter to randomize colors!");
             println!("[ok] Press F to trigger a divide-by-zero fault.");
+            println!("[ok] Press T to show uptime.");
 
-            // Poll keyboard in a loop. When Enter is pressed, pick a new
-            // background color using the CPU cycle counter as entropy.
+            // Interrupts were disabled during init. Now that all handlers are
+            // registered and the PIT is ticking, it's safe to let them through.
+            arch::Arch::enable_interrupts();
+            println!("[ok] Hardware interrupts enabled");
+
+            // Poll keyboard in a loop. `hlt` sleeps the CPU until the next
+            // interrupt (PIT fires every ~1ms), so we wake up, check for a
+            // keypress, and sleep again — much better than busy-spinning.
             loop {
                 if let Some(key) = arch::KeyboardDriver::poll() {
                     match key {
                         Key::Enter => {
                             let rand = arch::Arch::entropy();
                             let bg = framebuffer::Color((rand as u32) & 0x00FFFFFF);
-                            draw_splash(ptr, w, h, pitch, bg);
+                            let ms = arch::x86_64::pit::elapsed_ms();
+                            draw_splash(ptr, w, h, pitch, bg, Some(ms));
                             println!("[ok] Color: #{:06X}", bg.0);
                         }
                         Key::F => {
@@ -106,9 +114,14 @@ extern "C" fn kmain() -> ! {
                             println!("[!!] IDT installed — expect a panic message.");
                             arch::Arch::trigger_test_fault();
                         }
+                        Key::T => {
+                            let ms = arch::x86_64::pit::elapsed_ms();
+                            println!("[time] {}.{:03} seconds", ms / 1000, ms % 1000);
+                        }
                         _ => {}
                     }
                 }
+                arch::Arch::halt_until_interrupt();
             }
         }
     }
@@ -120,12 +133,13 @@ extern "C" fn kmain() -> ! {
 }
 
 // Paint the splash screen: solid background with centered title text.
-fn draw_splash(ptr: *mut u8, w: usize, h: usize, pitch: usize, bg: framebuffer::Color) {
+// If `uptime_ms` is provided, draw the uptime below the hint line.
+fn draw_splash(ptr: *mut u8, w: usize, h: usize, pitch: usize, bg: framebuffer::Color, uptime_ms: Option<u64>) {
     framebuffer::clear(ptr, w, h, pitch, bg);
 
     let title = "OBOOS v0.0";
     let subtitle = "Off By One Operating System";
-    let hint = "Enter = colors / F = fault";
+    let hint = "Enter = colors / F = fault / T = uptime";
     let title_x = (w - title.len() * 8) / 2;
     let subtitle_x = (w - subtitle.len() * 8) / 2;
     let hint_x = (w - hint.len() * 8) / 2;
@@ -134,6 +148,61 @@ fn draw_splash(ptr: *mut u8, w: usize, h: usize, pitch: usize, bg: framebuffer::
     framebuffer::draw_str(ptr, pitch, title_x, center_y, title, framebuffer::Color::WHITE);
     framebuffer::draw_str(ptr, pitch, subtitle_x, center_y + 16, subtitle, framebuffer::Color::LIGHT_GRAY);
     framebuffer::draw_str(ptr, pitch, hint_x, center_y + 40, hint, framebuffer::Color::LIGHT_GRAY);
+
+    if let Some(ms) = uptime_ms {
+        let mut buf = [0u8; 32];
+        let uptime_str = fmt_uptime(ms, &mut buf);
+        let uptime_x = (w - uptime_str.len() * 8) / 2;
+        framebuffer::draw_str(ptr, pitch, uptime_x, center_y + 64, uptime_str, framebuffer::Color::WHITE);
+    }
+}
+
+/// Format milliseconds as "Uptime: X.XXX s" into a stack buffer.
+/// Returns the written slice as a `&str`. We do this by hand because
+/// `format!` requires an allocator we don't have yet.
+fn fmt_uptime(ms: u64, buf: &mut [u8; 32]) -> &str {
+    let prefix = b"Uptime: ";
+    buf[..prefix.len()].copy_from_slice(prefix);
+    let mut pos = prefix.len();
+
+    // Write the whole-seconds part (variable width).
+    let secs = ms / 1000;
+    let frac = (ms % 1000) as u32;
+
+    // Convert seconds to decimal digits.
+    if secs == 0 {
+        buf[pos] = b'0';
+        pos += 1;
+    } else {
+        let mut digits = [0u8; 20];
+        let mut n = secs;
+        let mut len = 0;
+        while n > 0 {
+            digits[len] = b'0' + (n % 10) as u8;
+            n /= 10;
+            len += 1;
+        }
+        for i in (0..len).rev() {
+            buf[pos] = digits[i];
+            pos += 1;
+        }
+    }
+
+    // Write ".XXX s"
+    buf[pos] = b'.';
+    pos += 1;
+    buf[pos] = b'0' + (frac / 100) as u8;
+    pos += 1;
+    buf[pos] = b'0' + ((frac / 10) % 10) as u8;
+    pos += 1;
+    buf[pos] = b'0' + (frac % 10) as u8;
+    pos += 1;
+    buf[pos] = b' ';
+    pos += 1;
+    buf[pos] = b's';
+    pos += 1;
+
+    core::str::from_utf8(&buf[..pos]).unwrap()
 }
 
 /// Panic handler — required by `#![no_std]`.
