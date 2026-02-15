@@ -5,6 +5,7 @@
 
 #![no_std] // No standard library — we ARE the operating system.
 #![no_main] // No C runtime, no normal main(). We define our own entry point.
+#![feature(abi_x86_interrupt)] // Nightly: lets us write interrupt handlers with proper calling convention.
 
 mod arch;
 mod framebuffer;
@@ -102,7 +103,7 @@ extern "C" fn kmain() -> ! {
                         }
                         Key::F => {
                             println!("[!!] Triggering test fault...");
-                            println!("[!!] No IDT installed — expect a triple fault.");
+                            println!("[!!] IDT installed — expect a panic message.");
                             arch::Arch::trigger_test_fault();
                         }
                         _ => {}

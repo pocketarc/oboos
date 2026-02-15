@@ -52,7 +52,7 @@ use core::mem::size_of;
 ///
 /// So index 1 with RPL 0 = `0b0000_0000_0000_1_0_00` = 0x08.
 /// Selectors are always multiples of 8 because the bottom 3 bits are flags.
-const KERNEL_CODE_SELECTOR: u16 = 0x08; // GDT index 1 — 64-bit kernel code
+pub const KERNEL_CODE_SELECTOR: u16 = 0x08; // GDT index 1 — 64-bit kernel code
 const KERNEL_DATA_SELECTOR: u16 = 0x10; // GDT index 2 — kernel data
 const TSS_SELECTOR: u16 = 0x18; // GDT index 3 — TSS descriptor
 

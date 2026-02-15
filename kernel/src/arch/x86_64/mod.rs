@@ -1,6 +1,7 @@
 //! x86_64 platform implementation.
 
 pub mod gdt;
+pub mod interrupts;
 pub mod keyboard;
 pub mod port;
 pub mod serial;
@@ -22,6 +23,7 @@ impl Platform for X86_64 {
     fn init() -> Self {
         serial::Serial::init();
         gdt::init();
+        interrupts::init();
         X86_64
     }
 
