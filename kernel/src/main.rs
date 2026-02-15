@@ -10,7 +10,7 @@ mod arch;
 mod framebuffer;
 mod platform;
 
-use platform::Platform;
+use platform::{Key, Keyboard, Platform};
 
 // Limine boot protocol requests.
 //
@@ -46,7 +46,7 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 macro_rules! print {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
-        let _ = write!(crate::arch::x86_64::serial::Serial, $($arg)*);
+        let _ = write!(crate::arch::Serial, $($arg)*);
     }};
 }
 
@@ -64,7 +64,7 @@ macro_rules! println {
 #[unsafe(no_mangle)]
 extern "C" fn kmain() -> ! {
     // Initialize the platform (serial port, etc.)
-    let _platform = arch::X86_64::init();
+    let _platform = arch::Arch::init();
 
     // Verify the bootloader speaks our protocol revision.
     assert!(BASE_REVISION.is_supported());
@@ -87,17 +87,25 @@ extern "C" fn kmain() -> ! {
 
             draw_splash(ptr, w, h, pitch, framebuffer::Color::DARK_BLUE);
             println!("[ok] Press Enter to randomize colors!");
+            println!("[ok] Press F to trigger a divide-by-zero fault.");
 
             // Poll keyboard in a loop. When Enter is pressed, pick a new
             // background color using the CPU cycle counter as entropy.
             loop {
-                if let Some(scancode) = arch::x86_64::keyboard::poll_scancode() {
-                    // Only act on key press (make code), ignore release (0x80+).
-                    if scancode == arch::x86_64::keyboard::SC_ENTER {
-                        let tsc = arch::x86_64::read_tsc();
-                        let bg = framebuffer::Color((tsc & 0x00FFFFFF) as u32);
-                        draw_splash(ptr, w, h, pitch, bg);
-                        println!("[ok] Color: #{:06X}", bg.0);
+                if let Some(key) = arch::KeyboardDriver::poll() {
+                    match key {
+                        Key::Enter => {
+                            let rand = arch::Arch::entropy();
+                            let bg = framebuffer::Color((rand as u32) & 0x00FFFFFF);
+                            draw_splash(ptr, w, h, pitch, bg);
+                            println!("[ok] Color: #{:06X}", bg.0);
+                        }
+                        Key::F => {
+                            println!("[!!] Triggering test fault...");
+                            println!("[!!] No IDT installed — expect a triple fault.");
+                            arch::Arch::trigger_test_fault();
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -106,7 +114,7 @@ extern "C" fn kmain() -> ! {
 
     println!("No framebuffer available. Halting.");
     loop {
-        arch::X86_64::halt_until_interrupt();
+        arch::Arch::halt_until_interrupt();
     }
 }
 
@@ -116,7 +124,7 @@ fn draw_splash(ptr: *mut u8, w: usize, h: usize, pitch: usize, bg: framebuffer::
 
     let title = "OBOOS v0.0";
     let subtitle = "Off By One Operating System";
-    let hint = "Press Enter to change colors";
+    let hint = "Enter = colors / F = fault";
     let title_x = (w - title.len() * 8) / 2;
     let subtitle_x = (w - subtitle.len() * 8) / 2;
     let hint_x = (w - hint.len() * 8) / 2;
@@ -136,6 +144,6 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     println!("!!! KERNEL PANIC !!!");
     println!("{}", info);
     loop {
-        arch::X86_64::halt_until_interrupt();
+        arch::Arch::halt_until_interrupt();
     }
 }

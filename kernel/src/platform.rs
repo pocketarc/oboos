@@ -14,6 +14,47 @@ pub trait Platform {
     /// power compared to a busy spin loop — the CPU literally stops
     /// executing until hardware wakes it up.
     fn halt_until_interrupt();
+
+    /// Return a pseudo-random 64-bit value.
+    ///
+    /// Not cryptographically secure — uses whatever fast entropy source
+    /// the hardware provides (TSC on x86_64, `CNTPCT_EL0` on aarch64,
+    /// hardware RNG where available, etc.).
+    fn entropy() -> u64;
+
+    /// Deliberately trigger a CPU fault for testing exception handling.
+    ///
+    /// Without an IDT / vector table this will crash the machine (triple
+    /// fault on x86_64). Once exception handlers are installed, it
+    /// exercises them — useful for verifying fault handlers actually work.
+    fn trigger_test_fault() -> !;
+}
+
+/// Architecture-independent key identifiers.
+///
+/// The keyboard driver translates hardware-specific scancodes (PS/2 scan
+/// code set 1 on x86, USB HID codes on other platforms) into these
+/// variants. The rest of the kernel never sees raw scancodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Enter,
+    F,
+    /// A key we recognize but don't have a named variant for yet.
+    /// Carries the raw scancode for callers that want to inspect it.
+    Other(u8),
+}
+
+/// Keyboard input (polling mode).
+///
+/// Each architecture provides its own struct implementing this trait,
+/// hiding the underlying scancode format behind [`Key`].
+pub trait Keyboard {
+    /// Check for a pending key-press event.
+    ///
+    /// Returns `Some(key)` if a key was pressed since the last poll,
+    /// `None` if the buffer is empty. Only reports press events —
+    /// release events are consumed and discarded internally.
+    fn poll() -> Option<Key>;
 }
 
 /// Serial port access for debug output.
