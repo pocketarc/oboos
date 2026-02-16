@@ -378,11 +378,12 @@ extern "x86-interrupt" fn page_fault_handler(
     crate::println!();
     crate::println!("EXCEPTION: Page Fault (#PF)");
     crate::println!("  Faulting address: {:#018X}", faulting_address);
-    crate::println!("  Error code: {:#06X} ({}{}{})",
+    crate::println!("  Error code: {:#06X} ({}{}{}{})",
         error_code,
         if error_code & 1 != 0 { "protection violation" } else { "page not present" },
         if error_code & 2 != 0 { ", write" } else { ", read" },
         if error_code & 4 != 0 { ", user mode" } else { "" },
+        if error_code & 16 != 0 { ", instruction fetch (NX)" } else { "" },
     );
     print_frame(&frame);
     panic!("page fault");

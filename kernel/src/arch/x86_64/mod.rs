@@ -4,6 +4,7 @@ pub mod gdt;
 pub mod interrupts;
 pub mod keyboard;
 pub mod memory;
+pub mod paging;
 pub mod pic;
 pub mod pit;
 pub mod port;
@@ -104,11 +105,11 @@ impl MemoryManager for X86_64 {
         crate::memory::free_frame(addr)
     }
 
-    fn map_page(_virt: usize, _phys: usize, _flags: PageFlags) {
-        todo!("map_page: requires page table management (future phase)")
+    fn map_page(virt: usize, phys: usize, flags: PageFlags) {
+        paging::map_page(virt, phys, flags);
     }
 
-    fn unmap_page(_virt: usize) {
-        todo!("unmap_page: requires page table management (future phase)")
+    fn unmap_page(virt: usize) {
+        paging::unmap_page(virt);
     }
 }

@@ -104,7 +104,37 @@ pub trait ContextSwitch {
 }
 
 /// Page table entry flags.
+///
+/// These are architecture-independent constants that map to the permission
+/// bits in page table entries. Defined in the HAL so callers write
+/// `PageFlags::PRESENT | PageFlags::WRITABLE` without reaching into
+/// arch-specific code. The arch layer translates these to hardware bits.
+#[derive(Clone, Copy, Debug)]
 pub struct PageFlags(pub u64);
+
+impl PageFlags {
+    /// Page is present in physical memory (bit 0). Without this bit, any
+    /// access to the page triggers a page fault.
+    pub const PRESENT: Self = Self(1 << 0);
+    /// Page is writable (bit 1). Without this, writes trigger a page fault.
+    /// Reads are always allowed when PRESENT is set.
+    pub const WRITABLE: Self = Self(1 << 1);
+    /// Page is accessible from user mode / ring 3 (bit 2). Without this,
+    /// only supervisor code can touch the page.
+    pub const USER: Self = Self(1 << 2);
+    /// Disable instruction fetch from this page (bit 63). Requires the NXE
+    /// bit in the EFER MSR, which Limine enables for us. Prevents code
+    /// execution from data pages — a basic exploit mitigation.
+    pub const NO_EXECUTE: Self = Self(1 << 63);
+}
+
+impl core::ops::BitOr for PageFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
 
 /// Saved register state for a suspended task.
 pub struct TaskContext {
