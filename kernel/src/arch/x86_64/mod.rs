@@ -1,5 +1,6 @@
 //! x86_64 platform implementation.
 
+pub mod context;
 pub mod gdt;
 pub mod interrupts;
 pub mod keyboard;
@@ -15,6 +16,7 @@ pub mod serial;
 // submodules. When aarch64 is added, it re-exports its own types
 // under the same names.
 pub type Arch = X86_64;
+pub use context::TaskContext;
 pub use serial::Serial;
 pub use keyboard::Ps2Keyboard as KeyboardDriver;
 

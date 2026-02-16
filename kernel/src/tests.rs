@@ -14,6 +14,7 @@ pub fn run_all() {
     test_heap();
     test_frame_allocator();
     test_paging();
+    test_task();
     println!();
     println!("[ok] All smoke tests passed");
 }
@@ -90,4 +91,59 @@ fn test_paging() {
     arch::Arch::unmap_page(test_virt);
     memory::free_frame(frame);
     println!("[ok] Page table manipulation verified");
+}
+
+/// Verify task creation, stack allocation, initial context, and RAII cleanup.
+fn test_task() {
+    use crate::task::{Task, TaskId, TaskState};
+
+    // Bootstrap task: id=0, Running, no allocated stack.
+    let boot = Task::bootstrap();
+    assert_eq!(boot.id, TaskId(0));
+    assert_eq!(boot.state, TaskState::Running);
+    assert!(boot.stack_top().is_none());
+    println!("[test] Bootstrap task created (id=0, no allocated stack)");
+
+    // Dummy entry point — tasks must diverge (-> !).
+    fn dummy_entry() -> ! {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    // Create a new task and verify its stack, then drop it and check cleanup.
+    let task = Task::new(dummy_entry);
+    assert_eq!(task.id, TaskId(1));
+    assert_eq!(task.state, TaskState::Ready);
+    let top = task.stack_top().expect("new task should have a stack");
+    println!("[test] Task created (id=1, stack_top={:#018X})", top);
+
+    // Write/read through the stack virtual address to verify mapping works.
+    let test_ptr = (top - 4096) as *mut u64;
+    unsafe {
+        core::ptr::write_volatile(test_ptr, 0xCAFE_BABE_DEAD_BEEF);
+        let readback = core::ptr::read_volatile(test_ptr);
+        assert_eq!(readback, 0xCAFE_BABE_DEAD_BEEF);
+    }
+    println!("[test] Stack write/read verified");
+
+    // Verify the entry point was placed at the top of the initial stack frame.
+    let ret_addr_ptr = (top - 8) as *const u64;
+    let ret_addr = unsafe { core::ptr::read_volatile(ret_addr_ptr) };
+    assert_eq!(ret_addr, dummy_entry as *const () as u64);
+    println!("[test] Initial context verified (entry_point at top of stack)");
+
+    // Drop the task and verify stack frames are returned to the allocator.
+    let free_before_drop = memory::free_frame_count();
+    drop(task);
+    let free_after_drop = memory::free_frame_count();
+    assert_eq!(
+        free_after_drop - free_before_drop,
+        4,
+        "expected 4 stack frames freed, got {}",
+        free_after_drop - free_before_drop
+    );
+    println!("[test] Task drop freed stack frames correctly");
+
+    println!("[ok] Task creation and stack allocation verified");
 }

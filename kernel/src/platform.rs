@@ -136,7 +136,4 @@ impl core::ops::BitOr for PageFlags {
     }
 }
 
-/// Saved register state for a suspended task.
-pub struct TaskContext {
-    _placeholder: u64,
-}
+pub use crate::arch::TaskContext;

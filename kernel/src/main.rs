@@ -14,6 +14,7 @@ mod framebuffer;
 mod heap;
 mod memory;
 mod platform;
+mod task;
 #[cfg(feature = "smoke-test")]
 mod tests;
 
