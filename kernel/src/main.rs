@@ -7,8 +7,11 @@
 #![no_main] // No C runtime, no normal main(). We define our own entry point.
 #![feature(abi_x86_interrupt)] // Nightly: lets us write interrupt handlers with proper calling convention.
 
+extern crate alloc;
+
 mod arch;
 mod framebuffer;
+mod heap;
 mod memory;
 mod platform;
 
@@ -65,8 +68,33 @@ macro_rules! println {
 /// Kernel entry point — where the bootloader jumps to.
 #[unsafe(no_mangle)]
 extern "C" fn kmain() -> ! {
-    // Initialize the platform (serial port, etc.)
+    // Initialize the platform (serial port, GDT, IDT, PIC, memory, PIT).
     let _platform = arch::Arch::init();
+
+    // Initialize the kernel heap — unlocks Vec, Box, String, etc.
+    heap::init();
+
+    // Smoke-test the heap allocator.
+    {
+        use alloc::boxed::Box;
+        use alloc::string::String;
+        use alloc::vec::Vec;
+
+        let mut v = Vec::new();
+        v.push(1u32);
+        v.push(2);
+        v.push(3);
+        assert_eq!(v.iter().sum::<u32>(), 6);
+
+        let b = Box::new(42u64);
+        assert_eq!(*b, 42);
+
+        let mut s = String::from("OBOOS");
+        s.push_str(" heap works!");
+        assert_eq!(s, "OBOOS heap works!");
+
+        println!("[ok] Heap allocator verified (Vec, Box, String)");
+    }
 
     // Smoke-test the frame allocator: allocate 3 frames, free the middle one,
     // re-allocate (should recycle the freed frame), and report free count.
