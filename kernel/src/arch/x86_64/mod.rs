@@ -3,6 +3,7 @@
 pub mod gdt;
 pub mod interrupts;
 pub mod keyboard;
+pub mod memory;
 pub mod pic;
 pub mod pit;
 pub mod port;
@@ -16,7 +17,7 @@ pub type Arch = X86_64;
 pub use serial::Serial;
 pub use keyboard::Ps2Keyboard as KeyboardDriver;
 
-use crate::platform::{Platform, SerialConsole};
+use crate::platform::{MemoryManager, PageFlags, Platform, SerialConsole};
 
 /// x86_64 platform — implements [`Platform`] for 64-bit Intel/AMD.
 pub struct X86_64;
@@ -26,6 +27,11 @@ impl Platform for X86_64 {
         serial::Serial::init();
         gdt::init();
         interrupts::init();
+
+        // Discover physical memory and initialize the frame allocator.
+        // This must happen before anything that needs to allocate frames,
+        // but doesn't depend on timers or keyboard.
+        memory::init();
 
         // Program the PIT for 1 kHz, then register its tick handler.
         // This order matters: configure the hardware before unmasking
@@ -86,5 +92,23 @@ impl Platform for X86_64 {
                 options(noreturn, nomem, nostack),
             );
         }
+    }
+}
+
+impl MemoryManager for X86_64 {
+    fn alloc_physical_frame() -> Option<usize> {
+        crate::memory::alloc_frame()
+    }
+
+    fn free_physical_frame(addr: usize) {
+        crate::memory::free_frame(addr)
+    }
+
+    fn map_page(_virt: usize, _phys: usize, _flags: PageFlags) {
+        todo!("map_page: requires page table management (future phase)")
+    }
+
+    fn unmap_page(_virt: usize) {
+        todo!("unmap_page: requires page table management (future phase)")
     }
 }

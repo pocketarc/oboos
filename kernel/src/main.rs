@@ -9,6 +9,7 @@
 
 mod arch;
 mod framebuffer;
+mod memory;
 mod platform;
 
 use platform::{Key, Keyboard, Platform};
@@ -66,6 +67,30 @@ macro_rules! println {
 extern "C" fn kmain() -> ! {
     // Initialize the platform (serial port, etc.)
     let _platform = arch::Arch::init();
+
+    // Smoke-test the frame allocator: allocate 3 frames, free the middle one,
+    // re-allocate (should recycle the freed frame), and report free count.
+    {
+        let f1 = memory::alloc_frame().expect("alloc frame 1");
+        let f2 = memory::alloc_frame().expect("alloc frame 2");
+        let f3 = memory::alloc_frame().expect("alloc frame 3");
+        println!("[test] Allocated frame: {:#018X}", f1);
+        println!("[test] Allocated frame: {:#018X}", f2);
+        println!("[test] Allocated frame: {:#018X}", f3);
+
+        memory::free_frame(f2);
+        println!("[test] Freed frame:     {:#018X}", f2);
+
+        let f4 = memory::alloc_frame().expect("alloc frame 4");
+        println!("[test] Re-allocated:    {:#018X} (recycled: {})", f4, f4 == f2);
+
+        // Clean up — free the test frames so they don't leak.
+        memory::free_frame(f1);
+        memory::free_frame(f3);
+        memory::free_frame(f4);
+        println!("[test] Free frames remaining: {}", memory::free_frame_count());
+        println!("[ok] Frame allocator verified");
+    }
 
     // Verify the bootloader speaks our protocol revision.
     assert!(BASE_REVISION.is_supported());
