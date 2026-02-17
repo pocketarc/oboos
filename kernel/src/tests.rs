@@ -17,6 +17,7 @@ pub fn run_all() {
     test_paging();
     test_task();
     test_context_switch();
+    test_scheduler();
     println!();
     println!("[ok] All smoke tests passed");
 }
@@ -208,4 +209,63 @@ fn test_context_switch() {
 
     drop(task);
     println!("[ok] Context switch verified");
+}
+
+/// Verify cooperative round-robin scheduling with multiple tasks.
+///
+/// Spawns two tasks (A and B) that each increment a shared atomic counter
+/// 5 times, yielding after each increment. kmain yields 5 times to cycle
+/// through all three tasks in round-robin order. After the yields, both
+/// counters should have reached 5 — proving that the scheduler correctly
+/// rotates through tasks and that yield/resume works across multiple tasks.
+fn test_scheduler() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use crate::scheduler;
+
+    static COUNTER_A: AtomicU32 = AtomicU32::new(0);
+    static COUNTER_B: AtomicU32 = AtomicU32::new(0);
+
+    fn task_a() -> ! {
+        use core::sync::atomic::Ordering;
+        for _ in 0..5 {
+            COUNTER_A.fetch_add(1, Ordering::SeqCst);
+            crate::scheduler::yield_now();
+        }
+        // Work is done — spin-yield forever. No task exit mechanism yet.
+        loop {
+            crate::scheduler::yield_now();
+        }
+    }
+
+    fn task_b() -> ! {
+        use core::sync::atomic::Ordering;
+        for _ in 0..5 {
+            COUNTER_B.fetch_add(1, Ordering::SeqCst);
+            crate::scheduler::yield_now();
+        }
+        loop {
+            crate::scheduler::yield_now();
+        }
+    }
+
+    // Reset counters in case the test ever runs more than once.
+    COUNTER_A.store(0, Ordering::SeqCst);
+    COUNTER_B.store(0, Ordering::SeqCst);
+
+    scheduler::spawn(task_a);
+    scheduler::spawn(task_b);
+    println!("[test] Scheduler: spawned 2 tasks, yielding 5 times");
+
+    for _ in 0..5 {
+        scheduler::yield_now();
+    }
+
+    let a = COUNTER_A.load(Ordering::SeqCst);
+    let b = COUNTER_B.load(Ordering::SeqCst);
+    println!("[test] Scheduler: task A ran {} times, task B ran {} times", a, b);
+
+    assert_eq!(a, 5, "expected task A counter = 5, got {}", a);
+    assert_eq!(b, 5, "expected task B counter = 5, got {}", b);
+
+    println!("[ok] Cooperative round-robin scheduler verified");
 }

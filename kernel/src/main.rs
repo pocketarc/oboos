@@ -14,6 +14,7 @@ mod framebuffer;
 mod heap;
 mod memory;
 mod platform;
+mod scheduler;
 mod task;
 #[cfg(feature = "smoke-test")]
 mod tests;
@@ -76,6 +77,9 @@ extern "C" fn kmain() -> ! {
 
     // Initialize the kernel heap — unlocks Vec, Box, String, etc.
     heap::init();
+
+    // Initialize the cooperative scheduler — wraps kmain as the bootstrap task.
+    scheduler::init();
 
     // Run smoke tests when built with `--features smoke-test` (via `make test`).
     #[cfg(feature = "smoke-test")]
