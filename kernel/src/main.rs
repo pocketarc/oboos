@@ -16,6 +16,7 @@ mod heap;
 mod memory;
 mod platform;
 mod scheduler;
+mod store;
 mod task;
 mod timer;
 #[cfg(feature = "smoke-test")]
@@ -87,6 +88,9 @@ extern "C" fn kmain() -> ! {
     arch::keyboard::init();
     timer::init();
     arch::interrupts::set_irq_handler(1, arch::keyboard::on_key);
+
+    // Initialize the store registry — reactive state trees for IPC.
+    store::init();
 
     // Initialize the cooperative scheduler — wraps kmain as the bootstrap task.
     scheduler::init();

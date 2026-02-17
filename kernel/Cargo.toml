@@ -10,4 +10,5 @@ smoke-test = []
 font8x8 = { version = "0.3", default-features = false }
 limine = "0.5"
 linked_list_allocator = "0.10"
+oboos-api = { path = "../api" }
 spin = "0.9"

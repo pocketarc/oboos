@@ -1,5 +1,5 @@
 [workspace]
-members = ["kernel"]
+members = ["api", "kernel"]
 resolver = "2"
 
 [profile.dev]

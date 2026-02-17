@@ -7,7 +7,7 @@
 //!
 //! Run with `make test`. The normal `make run` skips these entirely.
 
-use crate::{arch, executor, memory, println, scheduler, timer};
+use crate::{arch, executor, memory, println, scheduler, store, timer};
 use crate::arch::TaskContext;
 use crate::platform::Platform;
 
@@ -25,6 +25,8 @@ pub fn run_all() {
     test_async_sleep();
     test_block_glyph();
     test_speaker();
+    test_store_basic();
+    test_store_validation();
     println!();
     println!("[ok] All smoke tests passed");
 }
@@ -524,4 +526,116 @@ fn test_speaker() {
     arch::speaker::stop();
     assert!(!arch::speaker::is_enabled(), "speaker should be disabled after stop");
     println!("[ok] PC speaker beep/stop verified");
+}
+
+/// Verify store create, get, set, and destroy.
+///
+/// Creates a 3-field store (count/U32, label/Str, active/Bool), reads
+/// defaults back, writes new values, reads them back, then destroys the
+/// store and verifies it's gone.
+fn test_store_basic() {
+    use alloc::string::String;
+    use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+    struct CounterSchema;
+    impl StoreSchema for CounterSchema {
+        fn name() -> &'static str { "Counter" }
+        fn fields() -> &'static [FieldDef] {
+            &[
+                FieldDef { name: "count", kind: FieldKind::U32 },
+                FieldDef { name: "label", kind: FieldKind::Str },
+                FieldDef { name: "active", kind: FieldKind::Bool },
+            ]
+        }
+    }
+
+    // Create with defaults.
+    let id = store::create::<CounterSchema>(&[
+        ("count", Value::U32(0)),
+        ("label", Value::Str(String::from("hello"))),
+        ("active", Value::Bool(true)),
+    ])
+    .expect("create failed");
+
+    // Read defaults back.
+    assert_eq!(store::get(id, "count").unwrap(), Value::U32(0));
+    assert_eq!(store::get(id, "label").unwrap(), Value::Str(String::from("hello")));
+    assert_eq!(store::get(id, "active").unwrap(), Value::Bool(true));
+
+    // Write new values.
+    store::set(id, "count", Value::U32(42)).expect("set count");
+    store::set(id, "label", Value::Str(String::from("world"))).expect("set label");
+    store::set(id, "active", Value::Bool(false)).expect("set active");
+
+    // Read them back.
+    assert_eq!(store::get(id, "count").unwrap(), Value::U32(42));
+    assert_eq!(store::get(id, "label").unwrap(), Value::Str(String::from("world")));
+    assert_eq!(store::get(id, "active").unwrap(), Value::Bool(false));
+
+    // Destroy and verify NotFound.
+    store::destroy(id).expect("destroy");
+    assert!(store::get(id, "count").is_err());
+    assert!(store::set(id, "count", Value::U32(1)).is_err());
+    assert!(store::destroy(id).is_err());
+
+    println!("[ok] Store basic operations verified (create, get, set, destroy)");
+}
+
+/// Verify store schema validation — unknown fields and type mismatches.
+///
+/// Creates a 2-field store (flag/Bool, score/U32) and verifies that
+/// accessing nonexistent fields and writing wrong types both produce
+/// the correct errors, while valid operations still work after errors.
+fn test_store_validation() {
+    use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+    struct TinySchema;
+    impl StoreSchema for TinySchema {
+        fn name() -> &'static str { "Tiny" }
+        fn fields() -> &'static [FieldDef] {
+            &[
+                FieldDef { name: "flag", kind: FieldKind::Bool },
+                FieldDef { name: "score", kind: FieldKind::U32 },
+            ]
+        }
+    }
+
+    let id = store::create::<TinySchema>(&[
+        ("flag", Value::Bool(false)),
+        ("score", Value::U32(100)),
+    ])
+    .expect("create failed");
+
+    // Unknown field on get.
+    match store::get(id, "nonexistent") {
+        Err(_) => {}
+        Ok(_) => panic!("expected UnknownField error on get"),
+    }
+
+    // Unknown field on set.
+    match store::set(id, "nonexistent", Value::U32(1)) {
+        Err(_) => {}
+        Ok(_) => panic!("expected UnknownField error on set"),
+    }
+
+    // Type mismatch: write U32 to a Bool field.
+    match store::set(id, "flag", Value::U32(1)) {
+        Err(_) => {}
+        Ok(_) => panic!("expected TypeMismatch error"),
+    }
+
+    // Type mismatch: write Bool to a U32 field.
+    match store::set(id, "score", Value::Bool(true)) {
+        Err(_) => {}
+        Ok(_) => panic!("expected TypeMismatch error"),
+    }
+
+    // Valid operations still work after errors.
+    store::set(id, "flag", Value::Bool(true)).expect("valid set after error");
+    assert_eq!(store::get(id, "flag").unwrap(), Value::Bool(true));
+    store::set(id, "score", Value::U32(200)).expect("valid set after error");
+    assert_eq!(store::get(id, "score").unwrap(), Value::U32(200));
+
+    store::destroy(id).expect("cleanup");
+    println!("[ok] Store schema validation verified (unknown field, type mismatch)");
 }
