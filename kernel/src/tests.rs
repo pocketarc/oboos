@@ -21,6 +21,7 @@ pub fn run_all() {
     test_scheduler();
     test_preemption();
     test_async_executor();
+    test_async_keyboard();
     println!();
     println!("[ok] All smoke tests passed");
 }
@@ -379,4 +380,45 @@ fn test_async_executor() {
     arch::Arch::disable_interrupts();
 
     println!("[ok] Async executor verified (future spawned, woken, completed in 2 polls)");
+}
+
+/// Verify async keyboard input: push_scancode → next_key → Key::Enter.
+///
+/// Spawns a future that awaits [`next_key()`], then simulates an IRQ
+/// by pushing a scancode into the buffer. The executor polls the future
+/// twice: once to store the waker (Pending), once after the scancode
+/// arrives (Ready). Also tests that break codes are filtered out.
+fn test_async_keyboard() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    static GOT_ENTER: AtomicBool = AtomicBool::new(false);
+    GOT_ENTER.store(false, Ordering::SeqCst);
+
+    // Spawn a future that awaits one key press and asserts it's Enter.
+    executor::spawn(async {
+        let key = arch::x86_64::keyboard::next_key().await;
+        assert_eq!(key, crate::platform::Key::Enter);
+        GOT_ENTER.store(true, Ordering::SeqCst);
+    });
+
+    // First poll — buffer is empty, future stores its waker and returns Pending.
+    executor::poll_once();
+    assert!(!GOT_ENTER.load(Ordering::SeqCst));
+
+    // Simulate IRQ: push a release code (should be skipped) then a make code.
+    // Must be called with IF=0 — same as a real IRQ handler.
+    arch::Arch::disable_interrupts();
+    arch::x86_64::keyboard::push_scancode(0x9C); // Enter release (0x1C | 0x80)
+    arch::x86_64::keyboard::push_scancode(0x1C); // Enter press
+    arch::Arch::enable_interrupts();
+
+    // Second poll — future finds the scancode, returns Ready(Key::Enter).
+    let completed = executor::poll_once();
+    assert!(GOT_ENTER.load(Ordering::SeqCst));
+    assert_eq!(completed, 1);
+
+    // poll_once() leaves IF=1. Restore IF=0 for subsequent code.
+    arch::Arch::disable_interrupts();
+
+    println!("[ok] Async keyboard input verified (push_scancode \u{2192} next_key \u{2192} Enter)");
 }

@@ -20,7 +20,7 @@ mod task;
 #[cfg(feature = "smoke-test")]
 mod tests;
 
-use platform::{Key, Keyboard, Platform};
+use platform::{Key, Platform};
 
 // Limine boot protocol requests.
 //
@@ -79,6 +79,12 @@ extern "C" fn kmain() -> ! {
     // Initialize the kernel heap — unlocks Vec, Box, String, etc.
     heap::init();
 
+    // Pre-allocate the keyboard scancode buffer while the heap is fresh,
+    // then register the IRQ handler. Order matters: allocate before
+    // unmasking the IRQ so the handler never needs to grow the buffer.
+    arch::x86_64::keyboard::init();
+    arch::x86_64::interrupts::set_irq_handler(1, arch::x86_64::keyboard::on_key);
+
     // Initialize the cooperative scheduler — wraps kmain as the bootstrap task.
     scheduler::init();
 
@@ -108,50 +114,63 @@ extern "C" fn kmain() -> ! {
 
             println!("[ok] Framebuffer: {}x{}, {} bpp", w, h, fb.bpp());
 
+            // Store framebuffer info in the global so the async keyboard
+            // task can draw without carrying raw pointers.
+            framebuffer::FRAMEBUFFER_INFO.call_once(|| framebuffer::FramebufferInfo {
+                ptr, width: w, height: h, pitch,
+            });
+
             draw_splash(ptr, w, h, pitch, framebuffer::Color::DARK_BLUE, None);
             println!("[ok] Press Enter to randomize colors!");
             println!("[ok] Press F to trigger a divide-by-zero fault.");
             println!("[ok] Press T to show uptime.");
 
-            // Interrupts were disabled during init. Now that all handlers are
-            // registered and the PIT is ticking, it's safe to let them through.
+            // Spawn the async keyboard task, enable interrupts, and hand
+            // control to the executor. The keyboard is now IRQ-driven —
+            // scancodes buffer in the interrupt handler, and the executor
+            // wakes the future when a key arrives.
+            executor::spawn(keyboard_task());
             arch::Arch::enable_interrupts();
             println!("[ok] Hardware interrupts enabled");
-
-            // Poll keyboard in a loop. `hlt` sleeps the CPU until the next
-            // interrupt (PIT fires every ~1ms), so we wake up, check for a
-            // keypress, and sleep again — much better than busy-spinning.
-            loop {
-                executor::poll_once();
-                if let Some(key) = arch::KeyboardDriver::poll() {
-                    match key {
-                        Key::Enter => {
-                            let rand = arch::Arch::entropy();
-                            let bg = framebuffer::Color((rand as u32) & 0x00FFFFFF);
-                            let ms = arch::x86_64::pit::elapsed_ms();
-                            draw_splash(ptr, w, h, pitch, bg, Some(ms));
-                            println!("[ok] Color: #{:06X}", bg.0);
-                        }
-                        Key::F => {
-                            println!("[!!] Triggering test fault...");
-                            println!("[!!] IDT installed — expect a panic message.");
-                            arch::Arch::trigger_test_fault();
-                        }
-                        Key::T => {
-                            let ms = arch::x86_64::pit::elapsed_ms();
-                            println!("[time] {}.{:03} seconds", ms / 1000, ms % 1000);
-                        }
-                        _ => {}
-                    }
-                }
-                arch::Arch::halt_until_interrupt();
-            }
+            executor::run(); // never returns
         }
     }
 
     println!("No framebuffer available. Halting.");
     loop {
         arch::Arch::halt_until_interrupt();
+    }
+}
+
+/// Async keyboard task — loops forever reading keys via the IRQ-driven
+/// [`arch::x86_64::keyboard::next_key()`] future and handling them the
+/// same way the old polling loop did.
+async fn keyboard_task() {
+    let fb = framebuffer::FRAMEBUFFER_INFO
+        .get()
+        .expect("framebuffer not initialized");
+
+    loop {
+        let key = arch::x86_64::keyboard::next_key().await;
+        match key {
+            Key::Enter => {
+                let rand = arch::Arch::entropy();
+                let bg = framebuffer::Color((rand as u32) & 0x00FFFFFF);
+                let ms = arch::x86_64::pit::elapsed_ms();
+                draw_splash(fb.ptr, fb.width, fb.height, fb.pitch, bg, Some(ms));
+                println!("[ok] Color: #{:06X}", bg.0);
+            }
+            Key::F => {
+                println!("[!!] Triggering test fault...");
+                println!("[!!] IDT installed — expect a panic message.");
+                arch::Arch::trigger_test_fault();
+            }
+            Key::T => {
+                let ms = arch::x86_64::pit::elapsed_ms();
+                println!("[time] {}.{:03} seconds", ms / 1000, ms % 1000);
+            }
+            _ => {}
+        }
     }
 }
 

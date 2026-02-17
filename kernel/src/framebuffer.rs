@@ -2,8 +2,35 @@
 //!
 //! This module is architecture-independent — it just writes pixels to a
 //! memory buffer. The framebuffer address and layout come from the bootloader.
+//!
+//! [`FramebufferInfo`] provides a global handle to the framebuffer so async
+//! tasks (like the keyboard handler) can draw without passing raw pointers
+//! through the call chain.
 
 use font8x8::legacy::BASIC_LEGACY;
+
+/// Framebuffer geometry — everything needed to write pixels.
+///
+/// Stored in a global [`spin::Once`] so that async tasks spawned from
+/// `kmain` can access the framebuffer without carrying raw pointers as
+/// function arguments.
+pub struct FramebufferInfo {
+    pub ptr: *mut u8,
+    pub width: usize,
+    pub height: usize,
+    pub pitch: usize,
+}
+
+// SAFETY: The framebuffer is a fixed region of physical memory mapped into
+// the kernel address space by the bootloader. There's only one CPU and no
+// concurrent writers — the keyboard task is the only consumer, and it runs
+// cooperatively via the executor (never preempted mid-draw).
+unsafe impl Send for FramebufferInfo {}
+unsafe impl Sync for FramebufferInfo {}
+
+/// Global framebuffer info, initialized once from `kmain` after the
+/// bootloader hands us the framebuffer response.
+pub static FRAMEBUFFER_INFO: spin::Once<FramebufferInfo> = spin::Once::new();
 
 /// Pixel color in 0x00RRGGBB format.
 ///
