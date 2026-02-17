@@ -17,6 +17,7 @@ mod memory;
 mod platform;
 mod scheduler;
 mod task;
+mod timer;
 #[cfg(feature = "smoke-test")]
 mod tests;
 
@@ -80,10 +81,11 @@ extern "C" fn kmain() -> ! {
     // Initialize the kernel heap — unlocks Vec, Box, String, etc.
     heap::init();
 
-    // Pre-allocate the keyboard scancode buffer while the heap is fresh,
-    // then register the IRQ handler. Order matters: allocate before
-    // unmasking the IRQ so the handler never needs to grow the buffer.
+    // Pre-allocate the keyboard scancode buffer and sleep registry while
+    // the heap is fresh. Order matters: allocate before unmasking IRQs
+    // so handlers never need to grow their buffers.
     arch::keyboard::init();
+    timer::init();
     arch::interrupts::set_irq_handler(1, arch::keyboard::on_key);
 
     // Initialize the cooperative scheduler — wraps kmain as the bootstrap task.
@@ -127,11 +129,11 @@ extern "C" fn kmain() -> ! {
             println!("[ok] Press F to trigger a divide-by-zero fault.");
             println!("[ok] Press T to show uptime.");
 
-            // Spawn the async keyboard task, enable interrupts, and hand
-            // control to the executor. The keyboard is now IRQ-driven —
-            // scancodes buffer in the interrupt handler, and the executor
-            // wakes the future when a key arrives.
+            // Spawn async tasks, enable interrupts, and hand control to
+            // the executor. The keyboard task is IRQ-driven via scancodes;
+            // the blink task is PIT-driven via timer::sleep().
             executor::spawn(keyboard_task());
+            executor::spawn(blink_task());
             arch::Arch::enable_interrupts();
             println!("[ok] Hardware interrupts enabled");
             executor::run(); // never returns
@@ -173,6 +175,30 @@ async fn keyboard_task() {
             }
             _ => {}
         }
+    }
+}
+
+/// Async blink task — toggles a block cursor on the splash screen at 2 Hz.
+///
+/// This runs concurrently with [`keyboard_task()`], proving the executor
+/// handles two hardware-driven async tasks: one woken by keyboard IRQ,
+/// one woken by PIT ticks via [`timer::sleep()`].
+async fn blink_task() {
+    let fb = framebuffer::FRAMEBUFFER_INFO
+        .get()
+        .expect("framebuffer not initialized");
+
+    let cursor_x = fb.width / 2;
+    let cursor_y = fb.height / 2 + 56;
+
+    loop {
+        // Draw the cursor (█ full block).
+        framebuffer::draw_str(fb.ptr, fb.pitch, cursor_x, cursor_y, "\u{2588}", framebuffer::Color::WHITE);
+        timer::sleep(500).await;
+
+        // Erase the cursor by drawing the same glyph in the background color.
+        framebuffer::draw_str(fb.ptr, fb.pitch, cursor_x, cursor_y, "\u{2588}", framebuffer::Color::DARK_BLUE);
+        timer::sleep(500).await;
     }
 }
 

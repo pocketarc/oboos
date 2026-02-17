@@ -81,4 +81,5 @@ pub fn tick() {
         TICKS += 1;
     }
     crate::scheduler::on_tick();
+    crate::timer::check_deadlines();
 }

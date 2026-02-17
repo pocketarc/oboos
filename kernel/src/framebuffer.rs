@@ -7,7 +7,7 @@
 //! tasks (like the keyboard handler) can draw without passing raw pointers
 //! through the call chain.
 
-use font8x8::legacy::BASIC_LEGACY;
+use font8x8::legacy::{BASIC_LEGACY, BLOCK_LEGACY};
 
 /// Framebuffer geometry — everything needed to write pixels.
 ///
@@ -62,13 +62,26 @@ impl Color {
 // per row. The font uses LSB-left ordering: bit 0 is the leftmost pixel,
 // bit 7 is the rightmost. For each set bit, we write a colored pixel into
 // the framebuffer at the corresponding offset.
-fn draw_char(fb_ptr: *mut u8, pitch: usize, x: usize, y: usize, c: char, color: Color) {
+/// Look up the 8x8 glyph bitmap for a character.
+///
+/// Returns 8 bytes (one per row, LSB-left). Supports ASCII (0–127)
+/// and Unicode Block Elements (U+2580–U+259F). Unknown characters
+/// fall back to the null glyph.
+pub(crate) fn glyph_for(c: char) -> [u8; 8] {
     let idx = c as usize;
-    let glyph = if idx < 128 {
+    if idx < 128 {
         BASIC_LEGACY[idx]
+    } else if (0x2580..=0x259F).contains(&idx) {
+        // Unicode Block Elements — glyphs like █ (full block) live in a
+        // separate font8x8 table indexed from U+2580.
+        BLOCK_LEGACY[idx - 0x2580]
     } else {
         BASIC_LEGACY[0]
-    };
+    }
+}
+
+fn draw_char(fb_ptr: *mut u8, pitch: usize, x: usize, y: usize, c: char, color: Color) {
+    let glyph = glyph_for(c);
     
     let (r, g, b) = ((color.0 >> 16) as u8, (color.0 >> 8) as u8, color.0 as u8);
 

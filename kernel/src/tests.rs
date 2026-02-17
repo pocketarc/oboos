@@ -7,7 +7,7 @@
 //!
 //! Run with `make test`. The normal `make run` skips these entirely.
 
-use crate::{arch, executor, memory, println, scheduler};
+use crate::{arch, executor, memory, println, scheduler, timer};
 use crate::arch::TaskContext;
 use crate::platform::Platform;
 
@@ -22,6 +22,8 @@ pub fn run_all() {
     test_preemption();
     test_async_executor();
     test_async_keyboard();
+    test_async_sleep();
+    test_block_glyph();
     println!();
     println!("[ok] All smoke tests passed");
 }
@@ -421,4 +423,91 @@ fn test_async_keyboard() {
     arch::Arch::disable_interrupts();
 
     println!("[ok] Async keyboard input verified (push_scancode \u{2192} next_key \u{2192} Enter)");
+}
+
+/// Verify async sleep by spawning a future that sleeps for 50 ms.
+///
+/// The test enables interrupts so the PIT fires and calls
+/// `check_deadlines()`, which wakes the sleeping future once the
+/// deadline has passed. After enough ticks, the executor polls the
+/// future to completion.
+fn test_async_sleep() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+    DONE.store(false, Ordering::SeqCst);
+
+    executor::spawn(async {
+        timer::sleep(50).await;
+        DONE.store(true, Ordering::SeqCst);
+    });
+
+    // First poll — computes deadline, registers waker, returns Pending.
+    executor::poll_once();
+    assert!(!DONE.load(Ordering::SeqCst));
+
+    // Enable interrupts and wait for the PIT to tick past the 50 ms
+    // deadline. check_deadlines() runs inside the tick handler and
+    // will wake our future.
+    arch::Arch::enable_interrupts();
+    while !DONE.load(Ordering::SeqCst) {
+        // Each hlt wakes on a PIT tick (~1 ms). After ~50 ticks the
+        // deadline expires, check_deadlines() wakes the future, and
+        // the next poll_once() completes it.
+        executor::poll_once();
+        arch::Arch::halt_until_interrupt();
+    }
+    arch::Arch::disable_interrupts();
+
+    assert!(DONE.load(Ordering::SeqCst));
+    println!("[ok] Async sleep verified (50 ms sleep completed)");
+}
+
+/// Verify that the block element glyph lookup returns correct data.
+///
+/// U+2588 (█ FULL BLOCK) should map to BLOCK_LEGACY[8] which is all
+/// 0xFF — every pixel lit in every row.
+fn test_block_glyph() {
+    use crate::framebuffer;
+
+    let full_block = framebuffer::glyph_for('\u{2588}');
+    println!("[test] U+2588 glyph: {:02X?}", full_block);
+    assert_eq!(full_block, [0xFF; 8], "U+2588 should be a solid 8x8 block");
+
+    // Sanity check: 'A' should come from BASIC_LEGACY.
+    let a_glyph = framebuffer::glyph_for('A');
+    println!("[test] 'A' glyph: {:02X?}", a_glyph);
+    assert_ne!(a_glyph, [0x00; 8], "'A' glyph should not be empty");
+
+    // U+2580 (▀ upper half block) — top 4 rows lit, bottom 4 empty.
+    let upper_half = framebuffer::glyph_for('\u{2580}');
+    println!("[test] U+2580 glyph: {:02X?}", upper_half);
+    assert_eq!(upper_half, [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
+
+    // Render U+2588 into a memory buffer and verify every pixel is lit.
+    // Pitch = 8 pixels * 4 bytes = 32 bytes per row. Buffer = 8 rows.
+    let mut buf = [0u8; 32 * 8];
+    let pitch = 32;
+    framebuffer::draw_str(buf.as_mut_ptr(), pitch, 0, 0, "\u{2588}", framebuffer::Color::WHITE);
+
+    let mut lit = 0;
+    let mut unlit = 0;
+    for row in 0..8 {
+        for col in 0..8 {
+            let offset = row * pitch + col * 4;
+            let b = buf[offset];
+            let g = buf[offset + 1];
+            let r = buf[offset + 2];
+            if r == 0xFF && g == 0xFF && b == 0xFF {
+                lit += 1;
+            } else {
+                unlit += 1;
+                println!("[test] UNLIT pixel at row={}, col={}: r={:02X} g={:02X} b={:02X}", row, col, r, g, b);
+            }
+        }
+    }
+    println!("[test] Full block render: {}/64 pixels lit, {}/64 unlit", lit, unlit);
+    assert_eq!(lit, 64, "full block should light all 64 pixels");
+
+    println!("[ok] Block element glyph lookup verified");
 }
