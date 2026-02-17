@@ -72,10 +72,13 @@ pub fn elapsed_ms() -> u64 {
 
 /// IRQ 0 handler — called by the interrupt stub every time the PIT fires.
 ///
-/// EOI is sent automatically by the IRQ dispatch stub in [`super::interrupts`],
-/// so we just increment the counter.
+/// Increments the tick counter, then notifies the scheduler so it can
+/// track time slices and preempt if needed. EOI has already been sent
+/// by the IRQ stub before we're called (required because we may
+/// context-switch away and not return for a while).
 pub fn tick() {
     unsafe {
         TICKS += 1;
     }
+    crate::scheduler::on_tick();
 }

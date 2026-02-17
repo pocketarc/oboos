@@ -19,6 +19,7 @@ pub mod switch;
 pub type Arch = X86_64;
 pub use context::TaskContext;
 pub use serial::Serial;
+pub(crate) use switch::task_trampoline;
 pub use keyboard::Ps2Keyboard as KeyboardDriver;
 
 use crate::platform::{ContextSwitch, MemoryManager, PageFlags, Platform, SerialConsole};

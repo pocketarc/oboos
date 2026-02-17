@@ -20,6 +20,20 @@
 
 use core::arch::naked_asm;
 
+/// Entry trampoline for newly spawned tasks.
+///
+/// When [`switch_context`] first switches to a new task, its `ret` pops
+/// this function's address. We enable interrupts (so the PIT can
+/// preempt this task) and `ret` again into the real entry point.
+///
+/// Without this trampoline, new tasks would start with IF=0 (because
+/// the scheduler disables interrupts before switching) and could never
+/// be preempted by the timer.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn task_trampoline() {
+    naked_asm!("sti", "ret");
+}
+
 /// Swap execution from one task to another.
 ///
 /// Saves callee-saved registers onto `current`'s stack, stores its RSP,

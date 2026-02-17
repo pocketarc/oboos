@@ -1,12 +1,13 @@
-//! Cooperative round-robin scheduler.
+//! Preemptive round-robin scheduler.
 //!
 //! Manages a set of kernel tasks and decides which one runs next. Tasks
-//! voluntarily give up the CPU by calling [`yield_now()`] — there's no
-//! timer-driven preemption yet.
+//! can voluntarily give up the CPU by calling [`yield_now()`], or be
+//! forcibly preempted by the PIT timer via [`on_tick()`].
 //!
-//! The scheduler uses a simple round-robin policy: each task gets one
-//! turn before cycling back. The ready queue is a [`VecDeque`] — pop
-//! from the front to run, push to the back when yielding.
+//! The scheduler uses a simple round-robin policy: each task gets a
+//! 10ms time slice before being preempted. The ready queue is a
+//! [`VecDeque`] — pop from the front to run, push to the back when
+//! switching out.
 //!
 //! ## The lock-across-switch problem
 //!
@@ -17,21 +18,42 @@
 //! drop the lock, then switch. This is safe because interrupts are
 //! disabled (no concurrent access) and the scheduler data is `'static`
 //! (pointers remain valid).
+//!
+//! ## Two paths into schedule()
+//!
+//! Both [`yield_now()`] and [`on_tick()`] funnel into the private
+//! [`schedule()`] function which does the actual round-robin swap:
+//!
+//! - **Cooperative** (`yield_now`): `cli` → `schedule()` → `sti`.
+//!   The task explicitly gives up its time slice.
+//!
+//! - **Preemptive** (`on_tick`): PIT fires → interrupt gate clears IF →
+//!   `schedule()` → `iretq` restores IF. The task is forcibly switched
+//!   out when its time slice expires.
 
 use alloc::collections::VecDeque;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch::{self, TaskContext};
 use crate::platform::{ContextSwitch, Platform};
 use crate::println;
 use crate::task::{Task, TaskState};
 
+/// 10ms time slice at 1 kHz PIT rate. Each PIT tick is ~1ms, so 10
+/// ticks gives each task 10ms of CPU time before forced preemption.
+const PREEMPT_TICKS: u32 = 10;
+
+/// Ticks remaining in the current task's time slice. Decremented by
+/// [`on_tick()`] on every PIT interrupt. When it hits zero, the
+/// scheduler forces a context switch and resets the counter.
+static TICKS_REMAINING: AtomicU32 = AtomicU32::new(PREEMPT_TICKS);
+
 /// Global scheduler instance. Initialized once from `kmain` via [`init()`],
-/// then accessed by [`spawn()`] and [`yield_now()`].
+/// then accessed by [`spawn()`], [`yield_now()`], and [`on_tick()`].
 ///
 /// [`spin::Once`] provides one-time initialization with a panic on
 /// double-init. The inner [`spin::Mutex`] protects concurrent access
-/// (relevant once we have preemption — for now, we disable interrupts
-/// around every access anyway).
+/// from both cooperative yields and preemptive timer interrupts.
 static SCHEDULER: spin::Once<spin::Mutex<Scheduler>> = spin::Once::new();
 
 /// The scheduler's internal state: which task is running and which are
@@ -40,7 +62,7 @@ struct Scheduler {
     /// The task currently executing on the CPU.
     current: Task,
     /// Tasks waiting for CPU time, in round-robin order. New tasks go
-    /// to the back; [`yield_now()`] pops from the front and pushes the
+    /// to the back; scheduling pops from the front and pushes the
     /// old current to the back.
     ready: VecDeque<Task>,
 }
@@ -65,7 +87,7 @@ pub fn init() {
 ///
 /// The task is created in the [`Ready`](TaskState::Ready) state and
 /// placed at the back of the ready queue. It won't run until the
-/// current task yields.
+/// current task yields or is preempted.
 pub fn spawn(entry_point: fn() -> !) {
     let task = Task::new(entry_point);
     let id = task.id.0;
@@ -78,31 +100,23 @@ pub fn spawn(entry_point: fn() -> !) {
     println!("[sched] Spawned task {}", id);
 }
 
-/// Yield the CPU to the next ready task.
+/// The shared scheduling core — performs the round-robin swap and
+/// context switch.
 ///
-/// Performs a round-robin swap: the current task moves to the back of
-/// the ready queue, and the front task becomes the new current. If no
-/// other tasks are ready, returns immediately (nothing to switch to).
-///
-/// This is the cooperative scheduling primitive — tasks call this when
-/// they're done with their current work slice. Without preemption, a
-/// task that never yields will starve all others.
-pub fn yield_now() {
-    // Disable interrupts for the entire schedule operation. We re-enable
-    // them after we resume (which may be much later, after other tasks
-    // have run and yielded back to us).
-    arch::Arch::disable_interrupts();
-
+/// Callers must ensure interrupts are disabled before calling. This
+/// function does not manage interrupt state — `yield_now()` does
+/// `cli`/`sti`, and `on_tick()` relies on the interrupt gate's IF=0
+/// and `iretq`'s IF restore.
+fn schedule() {
     // Scope the lock so it's dropped before the context switch.
-    let (save_to, restore_from) = {
+    let switch_targets = {
         let mut sched = SCHEDULER
             .get()
             .expect("scheduler not initialized")
             .lock();
 
-        // Nothing to switch to — return early.
+        // Nothing to switch to — return immediately.
         let Some(next) = sched.ready.pop_front() else {
-            arch::Arch::enable_interrupts();
             return;
         };
 
@@ -113,6 +127,9 @@ pub fn yield_now() {
         sched.current.state = TaskState::Running;
         sched.ready.push_back(prev);
 
+        // Reset the time slice for the incoming task.
+        TICKS_REMAINING.store(PREEMPT_TICKS, Ordering::Relaxed);
+
         // Extract raw pointers while we still hold the lock. The save_to
         // pointer targets the task we just pushed to the back of the ready
         // queue — that's where we want our registers saved so we can
@@ -122,20 +139,45 @@ pub fn yield_now() {
             as *mut TaskContext;
         let restore_from = &sched.current.context as *const TaskContext;
 
-        (save_to, restore_from)
+        Some((save_to, restore_from))
     };
     // Lock is dropped here — the switched-to task can safely lock the
     // scheduler on its next yield without deadlocking.
 
-    // Perform the actual context switch. This saves our registers into
-    // save_to, loads registers from restore_from, and swaps stacks.
-    // We won't execute the next line until some future yield switches
-    // back to us.
-    unsafe {
-        arch::Arch::switch(&mut *save_to, &*restore_from);
+    if let Some((save_to, restore_from)) = switch_targets {
+        // Perform the actual context switch. This saves our registers into
+        // save_to, loads registers from restore_from, and swaps stacks.
+        // We won't execute the next line until some future switch brings
+        // us back.
+        unsafe {
+            arch::Arch::switch(&mut *save_to, &*restore_from);
+        }
     }
+}
 
-    // We've been switched back. Re-enable interrupts now that we're
-    // running again.
+/// Yield the CPU to the next ready task.
+///
+/// Performs a round-robin swap: the current task moves to the back of
+/// the ready queue, and the front task becomes the new current. If no
+/// other tasks are ready, returns immediately (nothing to switch to).
+///
+/// This is the cooperative scheduling primitive — tasks call this when
+/// they're done with their current work slice.
+pub fn yield_now() {
+    arch::Arch::disable_interrupts();
+    schedule();
     arch::Arch::enable_interrupts();
+}
+
+/// Called from [`pit::tick()`](crate::arch::x86_64::pit::tick) on every
+/// PIT interrupt (1 kHz = every ~1ms).
+///
+/// Decrements the current task's remaining time slice. When it expires
+/// (hits zero), forces a context switch via [`schedule()`]. The
+/// interrupt gate guarantees IF=0, and `iretq` will restore the
+/// preempted task's RFLAGS (with IF=1) when it resumes.
+pub fn on_tick() {
+    if TICKS_REMAINING.fetch_sub(1, Ordering::Relaxed) == 1 {
+        schedule();
+    }
 }

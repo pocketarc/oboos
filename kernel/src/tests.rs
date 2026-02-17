@@ -7,8 +7,9 @@
 //!
 //! Run with `make test`. The normal `make run` skips these entirely.
 
-use crate::{arch, memory, println};
+use crate::{arch, memory, println, scheduler};
 use crate::arch::TaskContext;
+use crate::platform::Platform;
 
 /// Run all smoke tests. Called from `kmain` when `smoke-test` is active.
 pub fn run_all() {
@@ -18,6 +19,7 @@ pub fn run_all() {
     test_task();
     test_context_switch();
     test_scheduler();
+    test_preemption();
     println!();
     println!("[ok] All smoke tests passed");
 }
@@ -207,6 +209,11 @@ fn test_context_switch() {
     assert!(FLAG.load(Ordering::SeqCst), "task entry point never ran");
     println!("[test] Context switch: round-trip verified (flag was set)");
 
+    // The task_trampoline enables interrupts when the new task starts,
+    // so IF=1 here after the round-trip. Restore IF=0 for subsequent
+    // tests that assume interrupts are disabled.
+    arch::Arch::disable_interrupts();
+
     drop(task);
     println!("[ok] Context switch verified");
 }
@@ -268,4 +275,43 @@ fn test_scheduler() {
     assert_eq!(b, 5, "expected task B counter = 5, got {}", b);
 
     println!("[ok] Cooperative round-robin scheduler verified");
+}
+
+/// Verify preemptive scheduling by spawning a spinning task that never yields.
+///
+/// The spinning task increments an atomic counter in a tight loop without
+/// ever calling `yield_now()`. We enable interrupts and wait — if preemption
+/// works, the PIT will fire, expire the spinner's time slice, and switch
+/// back to us. We then check that the counter is non-zero, proving the
+/// spinner actually ran and was preempted.
+fn test_preemption() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn spinning_task() -> ! {
+        loop {
+            COUNTER.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    COUNTER.store(0, Ordering::SeqCst);
+    scheduler::spawn(spinning_task);
+
+    // Enable interrupts so the PIT can fire and preempt.
+    arch::Arch::enable_interrupts();
+
+    // Wait until the spinning task has had a time slice and incremented.
+    // Each hlt wakes on a PIT tick (~1ms). After ~20ms (2 time slices)
+    // the spinner should have run and we should have been switched back.
+    while COUNTER.load(Ordering::SeqCst) == 0 {
+        arch::Arch::halt_until_interrupt();
+    }
+
+    arch::Arch::disable_interrupts();
+
+    let count = COUNTER.load(Ordering::SeqCst);
+    assert!(count > 0, "spinning task never ran — preemption failed");
+
+    println!("[ok] Preemptive scheduling verified (counter = {})", count);
 }

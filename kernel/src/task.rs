@@ -41,8 +41,9 @@ const STACK_PAGES: usize = 4;
 const SLOT_PAGES: usize = STACK_PAGES + 1;
 
 /// Number of u64 values in the initial stack frame: 6 callee-saved
-/// registers (rbx, rbp, r12–r15) plus the entry point as return address.
-const INITIAL_FRAME_SLOTS: usize = 7;
+/// registers (rbx, rbp, r12–r15), the [`task_trampoline`](arch::task_trampoline)
+/// (which enables interrupts before falling through), and the entry point.
+const INITIAL_FRAME_SLOTS: usize = 8;
 
 // ————————————————————————————————————————————————————————————————————————————
 // Statics
@@ -121,7 +122,7 @@ impl Task {
     /// Create a new task that will begin executing at `entry_point`.
     ///
     /// Allocates a 16 KiB kernel stack (with guard page) and builds an
-    /// initial stack frame so that Phase 2b's context switch assembly can
+    /// initial stack frame so that the context switch assembly can
     /// "return" into the entry point. The entry function must never return
     /// (`-> !`) — there's nothing valid to return to.
     ///
@@ -129,25 +130,32 @@ impl Task {
     ///
     /// ```text
     /// stack_top:
-    ///   entry_point     <- ret pops this into RIP
-    ///   0 (rbx)         <- popped by switch assembly
+    ///   entry_point       <- trampoline's ret target
+    ///   task_trampoline   <- switch_context's ret target (enables IF)
+    ///   0 (rbx)           <- popped by switch assembly
     ///   0 (rbp)
     ///   0 (r12)
     ///   0 (r13)
     ///   0 (r14)
-    ///   0 (r15)         <- initial RSP points here
+    ///   0 (r15)           <- initial RSP points here
     /// ```
+    ///
+    /// The trampoline executes `sti; ret` — enabling interrupts so the PIT
+    /// can preempt this task, then falling through into the real entry point.
     pub fn new(entry_point: fn() -> !) -> Self {
         let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
         let slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed) as usize;
         let alloc = allocate_stack(slot);
 
-        // Place the entry point at the top of the stack as a return address.
-        // The 6 register slots below it are already zero from the page zeroing
-        // in allocate_stack().
+        // Place the entry point and trampoline at the top of the stack.
+        // switch_context's `ret` pops the trampoline, which does `sti; ret`
+        // to enable interrupts and pop the entry point into RIP.
+        // The 6 register slots below are already zero from page zeroing.
         unsafe {
-            let ret_addr_ptr = (alloc.stack_top as *mut u64).sub(1);
-            core::ptr::write(ret_addr_ptr, entry_point as *const () as u64);
+            let entry_ptr = (alloc.stack_top as *mut u64).sub(1);
+            core::ptr::write(entry_ptr, entry_point as *const () as u64);
+            let tramp_ptr = (alloc.stack_top as *mut u64).sub(2);
+            core::ptr::write(tramp_ptr, arch::task_trampoline as *const () as u64);
         }
 
         let context = TaskContext {

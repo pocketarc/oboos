@@ -197,21 +197,28 @@ pub fn set_irq_handler(irq: u8, handler: fn()) {
 /// Generate 16 IRQ handler stubs — one per hardware interrupt line.
 ///
 /// Each stub is an `extern "x86-interrupt"` function that:
-/// 1. Looks up the registered handler in [`IRQ_HANDLERS`]
-/// 2. Calls it if present (otherwise the IRQ is silently ignored)
-/// 3. Sends EOI to the PIC so it will deliver the next interrupt
+/// 1. Sends EOI to the PIC before calling the handler
+/// 2. Looks up the registered handler in [`IRQ_HANDLERS`]
+/// 3. Calls it if present (otherwise the IRQ is silently ignored)
+///
+/// EOI is sent *before* the handler because a handler may context-switch
+/// away (e.g., the PIT tick triggers preemptive scheduling). If we sent
+/// EOI after the handler, a context switch would delay it until the task
+/// cycles back — blocking all further interrupts on that IRQ line. This
+/// is safe because IF=0 (interrupt gate) and PIT/keyboard are
+/// edge-triggered.
 ///
 /// We use a macro because the only difference between the 16 handlers is
 /// the IRQ number, and writing them by hand would be tedious and error-prone.
 macro_rules! irq_handler {
     ($name:ident, $irq:expr) => {
         extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
+            pic::acknowledge($irq);
             unsafe {
                 if let Some(handler) = IRQ_HANDLERS[$irq] {
                     handler();
                 }
             }
-            pic::acknowledge($irq);
         }
     };
 }
