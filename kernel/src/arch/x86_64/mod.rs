@@ -10,6 +10,7 @@ pub mod pic;
 pub mod pit;
 pub mod port;
 pub mod serial;
+pub mod speaker;
 pub mod switch;
 
 // Re-export arch types under neutral names so the kernel can use

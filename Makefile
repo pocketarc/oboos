@@ -5,7 +5,8 @@ ISO = oboos.iso
 ISO_ROOT = iso_root
 LIMINE_DIR = limine
 
-QEMU_FLAGS = -cdrom $(ISO) -serial stdio -no-reboot -no-shutdown -m 128M
+QEMU_FLAGS = -cdrom $(ISO) -serial stdio -no-reboot -no-shutdown -m 128M \
+	-audiodev coreaudio,id=audio0 -machine pcspk-audiodev=audio0
 TEST_TIMEOUT ?= 5
 
 all: iso

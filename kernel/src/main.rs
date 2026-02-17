@@ -134,6 +134,7 @@ extern "C" fn kmain() -> ! {
             // the blink task is PIT-driven via timer::sleep().
             executor::spawn(keyboard_task());
             executor::spawn(blink_task());
+            executor::spawn(boot_chime());
             arch::Arch::enable_interrupts();
             println!("[ok] Hardware interrupts enabled");
             executor::run(); // never returns
@@ -176,6 +177,55 @@ async fn keyboard_task() {
             _ => {}
         }
     }
+}
+
+/// Async boot chime — plays the opening riff of Doom's E1M1 ("At Doom's
+/// Gate") as a nod to the kernel-mode Doom milestone on the roadmap.
+///
+/// The riff is a chromatic descent from E: a continuous E4 drone with
+/// melody notes (E5→D4→C4→Bb3→B3→C4) punching through — no silence
+/// between notes, just like the original palm-muted guitar line.
+async fn boot_chime() {
+    // E1M1 "At Doom's Gate" opening riff — two phrases.
+    // No gaps between notes: repeated pedal tones merge into a drone
+    // and the chromatic descent notes are heard as pitch changes.
+    let t = arch::speaker::play_tone;
+
+    // Phrase 1 (E pedal): E E E' E E D  E E C  E E Bb E E B  C
+    t(330, 120).await;  // E4
+    t(330, 120).await;  // E4
+    t(659, 120).await;  // E5 (octave)
+    t(330, 120).await;  // E4
+    t(330, 120).await;  // E4
+    t(294, 120).await;  // D4
+    t(330, 120).await;  // E4
+    t(330, 120).await;  // E4
+    t(262, 120).await;  // C4
+    t(330, 120).await;  // E4
+    t(330, 120).await;  // E4
+    t(233, 120).await;  // Bb3
+    t(330, 120).await;  // E4
+    t(330, 120).await;  // E4
+    t(247, 120).await;  // B3
+    t(262, 120).await;  // C4
+
+    // Phrase 2 (A pedal): same pattern shifted up a fourth.
+    t(440, 120).await;  // A4
+    t(440, 120).await;  // A4
+    t(880, 120).await;  // A5 (octave)
+    t(440, 120).await;  // A4
+    t(440, 120).await;  // A4
+    t(392, 120).await;  // G4
+    t(440, 120).await;  // A4
+    t(440, 120).await;  // A4
+    t(349, 120).await;  // F4
+    t(440, 120).await;  // A4
+    t(440, 120).await;  // A4
+    t(311, 120).await;  // Eb4
+    t(440, 120).await;  // A4
+    t(440, 120).await;  // A4
+    t(330, 120).await;  // E4
+    t(349, 120).await;  // F4
 }
 
 /// Async blink task — toggles a block cursor on the splash screen at 2 Hz.

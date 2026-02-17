@@ -24,6 +24,7 @@ pub fn run_all() {
     test_async_keyboard();
     test_async_sleep();
     test_block_glyph();
+    test_speaker();
     println!();
     println!("[ok] All smoke tests passed");
 }
@@ -510,4 +511,17 @@ fn test_block_glyph() {
     assert_eq!(lit, 64, "full block should light all 64 pixels");
 
     println!("[ok] Block element glyph lookup verified");
+}
+
+/// Verify PC speaker beep/stop by checking port 0x61 bits.
+///
+/// Can't test `play_tone()` here because it's async and needs the PIT
+/// running with interrupts enabled. But beep/stop are synchronous port
+/// I/O — we just verify the speaker enable bit toggles correctly.
+fn test_speaker() {
+    arch::speaker::beep(440); // A4 — concert pitch
+    assert!(arch::speaker::is_enabled(), "speaker should be enabled after beep");
+    arch::speaker::stop();
+    assert!(!arch::speaker::is_enabled(), "speaker should be disabled after stop");
+    println!("[ok] PC speaker beep/stop verified");
 }
