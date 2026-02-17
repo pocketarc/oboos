@@ -169,7 +169,7 @@ pub fn yield_now() {
     arch::Arch::enable_interrupts();
 }
 
-/// Called from [`pit::tick()`](crate::arch::x86_64::pit::tick) on every
+/// Called from [`pit::tick()`](crate::arch::pit::tick) on every
 /// PIT interrupt (1 kHz = every ~1ms).
 ///
 /// Decrements the current task's remaining time slice. When it expires

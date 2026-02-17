@@ -90,7 +90,7 @@ fn test_paging() {
 
     // Cross-check: read the same physical frame through the HHDM.
     // If our mapping points to the right frame, both views see the same data.
-    let hhdm_ptr = arch::x86_64::memory::phys_to_virt(frame as u64) as *const u64;
+    let hhdm_ptr = arch::memory::phys_to_virt(frame as u64) as *const u64;
     let hhdm_val = unsafe { core::ptr::read_volatile(hhdm_ptr) };
     assert_eq!(hhdm_val, 0xDEAD_BEEF_CAFE_BABE);
     println!("[test] Paging: HHDM cross-check confirmed");
@@ -396,7 +396,7 @@ fn test_async_keyboard() {
 
     // Spawn a future that awaits one key press and asserts it's Enter.
     executor::spawn(async {
-        let key = arch::x86_64::keyboard::next_key().await;
+        let key = arch::keyboard::next_key().await;
         assert_eq!(key, crate::platform::Key::Enter);
         GOT_ENTER.store(true, Ordering::SeqCst);
     });
@@ -408,8 +408,8 @@ fn test_async_keyboard() {
     // Simulate IRQ: push a release code (should be skipped) then a make code.
     // Must be called with IF=0 — same as a real IRQ handler.
     arch::Arch::disable_interrupts();
-    arch::x86_64::keyboard::push_scancode(0x9C); // Enter release (0x1C | 0x80)
-    arch::x86_64::keyboard::push_scancode(0x1C); // Enter press
+    arch::keyboard::push_scancode(0x9C); // Enter release (0x1C | 0x80)
+    arch::keyboard::push_scancode(0x1C); // Enter press
     arch::Arch::enable_interrupts();
 
     // Second poll — future finds the scancode, returns Ready(Key::Enter).

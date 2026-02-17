@@ -2,9 +2,7 @@
 //!
 //! Translates raw PS/2 scan code set 1 into architecture-independent
 //! [`Key`] values. The keyboard IRQ (IRQ 1) pushes scancodes into a
-//! ring buffer; the async [`next_key()`] future drains it. The sync
-//! [`Keyboard::poll()`] also reads from the buffer, so both paths are
-//! consistent after IRQ registration.
+//! ring buffer; the async [`next_key()`] future drains it.
 //!
 //! ## Interrupt safety
 //!
@@ -19,7 +17,7 @@ use alloc::collections::VecDeque;
 use core::future::Future;
 use core::task::Waker;
 
-use crate::platform::{Key, Keyboard, Platform};
+use crate::platform::{Key, Platform};
 use super::port::inb;
 
 // PS/2 keyboard controller ports. These have been the same since the IBM PC AT (1984).
@@ -117,37 +115,6 @@ fn translate_scancode(scancode: u8) -> Key {
         SC_F => Key::F,
         SC_T => Key::T,
         other => Key::Other(other),
-    }
-}
-
-/// PS/2 keyboard driver — translates hardware scancodes into [`Key`] values.
-pub struct Ps2Keyboard;
-
-impl Keyboard for Ps2Keyboard {
-    /// Read the next key press from the scancode buffer.
-    ///
-    /// After IRQ registration, scancodes arrive via the interrupt
-    /// handler and are buffered. This method drains break codes and
-    /// returns the first make code, or `None` if the buffer is empty.
-    ///
-    /// Disables interrupts while holding the lock to prevent deadlock
-    /// with the IRQ handler.
-    fn poll() -> Option<Key> {
-        crate::arch::Arch::disable_interrupts();
-        let mut state = STATE.lock();
-
-        while let Some(scancode) = state.buffer.pop_front() {
-            if scancode & 0x80 != 0 {
-                continue;
-            }
-            drop(state);
-            crate::arch::Arch::enable_interrupts();
-            return Some(translate_scancode(scancode));
-        }
-
-        drop(state);
-        crate::arch::Arch::enable_interrupts();
-        None
     }
 }
 

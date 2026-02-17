@@ -13,9 +13,9 @@ pub mod serial;
 pub mod switch;
 
 // Re-export arch types under neutral names so the kernel can use
-// `arch::Serial` and `arch::KeyboardDriver` without reaching into
-// submodules. When aarch64 is added, it re-exports its own types
-// under the same names.
+// `arch::Arch` and `arch::Serial` without reaching into submodules.
+// When aarch64 is added, it re-exports its own types under the
+// same names.
 pub type Arch = X86_64;
 pub use context::TaskContext;
 pub use serial::Serial;
@@ -75,6 +75,10 @@ impl Platform for X86_64 {
             core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
         }
         ((hi as u64) << 32) | (lo as u64)
+    }
+
+    fn elapsed_ms() -> u64 {
+        pit::elapsed_ms()
     }
 
     /// Trigger a divide-by-zero exception (#DE, vector 0).

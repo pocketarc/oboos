@@ -20,6 +20,7 @@ mod task;
 #[cfg(feature = "smoke-test")]
 mod tests;
 
+use framebuffer::FramebufferInfo;
 use platform::{Key, Platform};
 
 // Limine boot protocol requests.
@@ -82,8 +83,8 @@ extern "C" fn kmain() -> ! {
     // Pre-allocate the keyboard scancode buffer while the heap is fresh,
     // then register the IRQ handler. Order matters: allocate before
     // unmasking the IRQ so the handler never needs to grow the buffer.
-    arch::x86_64::keyboard::init();
-    arch::x86_64::interrupts::set_irq_handler(1, arch::x86_64::keyboard::on_key);
+    arch::keyboard::init();
+    arch::interrupts::set_irq_handler(1, arch::keyboard::on_key);
 
     // Initialize the cooperative scheduler — wraps kmain as the bootstrap task.
     scheduler::init();
@@ -120,7 +121,8 @@ extern "C" fn kmain() -> ! {
                 ptr, width: w, height: h, pitch,
             });
 
-            draw_splash(ptr, w, h, pitch, framebuffer::Color::DARK_BLUE, None);
+            let fbi = framebuffer::FRAMEBUFFER_INFO.get().unwrap();
+            draw_splash(fbi, framebuffer::Color::DARK_BLUE, None);
             println!("[ok] Press Enter to randomize colors!");
             println!("[ok] Press F to trigger a divide-by-zero fault.");
             println!("[ok] Press T to show uptime.");
@@ -143,7 +145,7 @@ extern "C" fn kmain() -> ! {
 }
 
 /// Async keyboard task — loops forever reading keys via the IRQ-driven
-/// [`arch::x86_64::keyboard::next_key()`] future and handling them the
+/// [`arch::keyboard::next_key()`] future and handling them the
 /// same way the old polling loop did.
 async fn keyboard_task() {
     let fb = framebuffer::FRAMEBUFFER_INFO
@@ -151,13 +153,13 @@ async fn keyboard_task() {
         .expect("framebuffer not initialized");
 
     loop {
-        let key = arch::x86_64::keyboard::next_key().await;
+        let key = arch::keyboard::next_key().await;
         match key {
             Key::Enter => {
                 let rand = arch::Arch::entropy();
                 let bg = framebuffer::Color((rand as u32) & 0x00FFFFFF);
-                let ms = arch::x86_64::pit::elapsed_ms();
-                draw_splash(fb.ptr, fb.width, fb.height, fb.pitch, bg, Some(ms));
+                let ms = arch::Arch::elapsed_ms();
+                draw_splash(fb, bg, Some(ms));
                 println!("[ok] Color: #{:06X}", bg.0);
             }
             Key::F => {
@@ -166,7 +168,7 @@ async fn keyboard_task() {
                 arch::Arch::trigger_test_fault();
             }
             Key::T => {
-                let ms = arch::x86_64::pit::elapsed_ms();
+                let ms = arch::Arch::elapsed_ms();
                 println!("[time] {}.{:03} seconds", ms / 1000, ms % 1000);
             }
             _ => {}
@@ -176,26 +178,26 @@ async fn keyboard_task() {
 
 // Paint the splash screen: solid background with centered title text.
 // If `uptime_ms` is provided, draw the uptime below the hint line.
-fn draw_splash(ptr: *mut u8, w: usize, h: usize, pitch: usize, bg: framebuffer::Color, uptime_ms: Option<u64>) {
-    framebuffer::clear(ptr, w, h, pitch, bg);
+fn draw_splash(fb: &FramebufferInfo, bg: framebuffer::Color, uptime_ms: Option<u64>) {
+    framebuffer::clear(fb.ptr, fb.width, fb.height, fb.pitch, bg);
 
     let title = "OBOOS v0.0";
     let subtitle = "Off By One Operating System";
     let hint = "Enter = colors / F = fault / T = uptime";
-    let title_x = (w - title.len() * 8) / 2;
-    let subtitle_x = (w - subtitle.len() * 8) / 2;
-    let hint_x = (w - hint.len() * 8) / 2;
-    let center_y = h / 2 - 16;
+    let title_x = (fb.width - title.len() * 8) / 2;
+    let subtitle_x = (fb.width - subtitle.len() * 8) / 2;
+    let hint_x = (fb.width - hint.len() * 8) / 2;
+    let center_y = fb.height / 2 - 16;
 
-    framebuffer::draw_str(ptr, pitch, title_x, center_y, title, framebuffer::Color::WHITE);
-    framebuffer::draw_str(ptr, pitch, subtitle_x, center_y + 16, subtitle, framebuffer::Color::LIGHT_GRAY);
-    framebuffer::draw_str(ptr, pitch, hint_x, center_y + 40, hint, framebuffer::Color::LIGHT_GRAY);
+    framebuffer::draw_str(fb.ptr, fb.pitch, title_x, center_y, title, framebuffer::Color::WHITE);
+    framebuffer::draw_str(fb.ptr, fb.pitch, subtitle_x, center_y + 16, subtitle, framebuffer::Color::LIGHT_GRAY);
+    framebuffer::draw_str(fb.ptr, fb.pitch, hint_x, center_y + 40, hint, framebuffer::Color::LIGHT_GRAY);
 
     if let Some(ms) = uptime_ms {
         let mut buf = [0u8; 32];
         let uptime_str = fmt_uptime(ms, &mut buf);
-        let uptime_x = (w - uptime_str.len() * 8) / 2;
-        framebuffer::draw_str(ptr, pitch, uptime_x, center_y + 64, uptime_str, framebuffer::Color::WHITE);
+        let uptime_x = (fb.width - uptime_str.len() * 8) / 2;
+        framebuffer::draw_str(fb.ptr, fb.pitch, uptime_x, center_y + 64, uptime_str, framebuffer::Color::WHITE);
     }
 }
 
