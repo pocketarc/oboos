@@ -8,6 +8,7 @@
 //! Run with `make test`. The normal `make run` skips these entirely.
 
 use crate::{arch, memory, println};
+use crate::arch::TaskContext;
 
 /// Run all smoke tests. Called from `kmain` when `smoke-test` is active.
 pub fn run_all() {
@@ -15,6 +16,7 @@ pub fn run_all() {
     test_frame_allocator();
     test_paging();
     test_task();
+    test_context_switch();
     println!();
     println!("[ok] All smoke tests passed");
 }
@@ -146,4 +148,64 @@ fn test_task() {
     println!("[test] Task drop freed stack frames correctly");
 
     println!("[ok] Task creation and stack allocation verified");
+}
+
+/// Verify context switching by doing a round-trip: switch from the boot
+/// context into a new task, which sets a flag and switches back. If we
+/// resume and the flag is set, the switch worked in both directions.
+fn test_context_switch() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use crate::platform::ContextSwitch;
+    use crate::task::Task;
+
+    static FLAG: AtomicBool = AtomicBool::new(false);
+
+    // Two TaskContext values: one for the boot side of this test, one
+    // for the spawned task. We use `static mut` because the switch
+    // assembly needs stable addresses, and we're single-threaded with
+    // interrupts disabled during tests.
+    static mut BOOT_CTX: TaskContext = TaskContext::zero();
+    static mut TASK_CTX: TaskContext = TaskContext::zero();
+
+    fn task_entry() -> ! {
+        // We've landed in the new task. Set the flag to prove we got here,
+        // then switch back to the boot context so the test can verify.
+        FLAG.store(true, Ordering::SeqCst);
+
+        unsafe {
+            arch::Arch::switch(
+                &mut *(&raw mut TASK_CTX),
+                &*(&raw const BOOT_CTX),
+            );
+        }
+
+        // Should never reach here — the boot side drops the task after
+        // verifying the flag. But tasks must diverge.
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    let task = Task::new(task_entry);
+    println!("[test] Context switch: created task {}", task.id.0);
+
+    // Copy the task's pre-built context into the static so the assembly
+    // can save/restore through stable addresses.
+    unsafe {
+        *(&raw mut TASK_CTX) = task.context;
+    }
+
+    // Switch into the new task. When it switches back, we resume here.
+    unsafe {
+        arch::Arch::switch(
+            &mut *(&raw mut BOOT_CTX),
+            &*(&raw const TASK_CTX),
+        );
+    }
+
+    assert!(FLAG.load(Ordering::SeqCst), "task entry point never ran");
+    println!("[test] Context switch: round-trip verified (flag was set)");
+
+    drop(task);
+    println!("[ok] Context switch verified");
 }

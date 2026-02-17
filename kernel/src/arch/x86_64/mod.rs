@@ -10,6 +10,7 @@ pub mod pic;
 pub mod pit;
 pub mod port;
 pub mod serial;
+pub mod switch;
 
 // Re-export arch types under neutral names so the kernel can use
 // `arch::Serial` and `arch::KeyboardDriver` without reaching into
@@ -20,7 +21,7 @@ pub use context::TaskContext;
 pub use serial::Serial;
 pub use keyboard::Ps2Keyboard as KeyboardDriver;
 
-use crate::platform::{MemoryManager, PageFlags, Platform, SerialConsole};
+use crate::platform::{ContextSwitch, MemoryManager, PageFlags, Platform, SerialConsole};
 
 /// x86_64 platform — implements [`Platform`] for 64-bit Intel/AMD.
 pub struct X86_64;
@@ -113,5 +114,13 @@ impl MemoryManager for X86_64 {
 
     fn unmap_page(virt: usize) {
         paging::unmap_page(virt);
+    }
+}
+
+impl ContextSwitch for X86_64 {
+    unsafe fn switch(current: &mut TaskContext, next: &TaskContext) {
+        unsafe {
+            switch::switch_context(current as *mut _ as *mut u64, next as *const _ as *const u64);
+        }
     }
 }
