@@ -10,6 +10,7 @@
 extern crate alloc;
 
 mod arch;
+mod executor;
 mod framebuffer;
 mod heap;
 mod memory;
@@ -81,6 +82,9 @@ extern "C" fn kmain() -> ! {
     // Initialize the cooperative scheduler — wraps kmain as the bootstrap task.
     scheduler::init();
 
+    // Initialize the async executor — polls futures from kmain's main loop.
+    executor::init();
+
     // Run smoke tests when built with `--features smoke-test` (via `make test`).
     #[cfg(feature = "smoke-test")]
     tests::run_all();
@@ -118,6 +122,7 @@ extern "C" fn kmain() -> ! {
             // interrupt (PIT fires every ~1ms), so we wake up, check for a
             // keypress, and sleep again — much better than busy-spinning.
             loop {
+                executor::poll_once();
                 if let Some(key) = arch::KeyboardDriver::poll() {
                     match key {
                         Key::Enter => {

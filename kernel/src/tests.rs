@@ -7,7 +7,7 @@
 //!
 //! Run with `make test`. The normal `make run` skips these entirely.
 
-use crate::{arch, memory, println, scheduler};
+use crate::{arch, executor, memory, println, scheduler};
 use crate::arch::TaskContext;
 use crate::platform::Platform;
 
@@ -20,6 +20,7 @@ pub fn run_all() {
     test_context_switch();
     test_scheduler();
     test_preemption();
+    test_async_executor();
     println!();
     println!("[ok] All smoke tests passed");
 }
@@ -314,4 +315,68 @@ fn test_preemption() {
     assert!(count > 0, "spinning task never ran — preemption failed");
 
     println!("[ok] Preemptive scheduling verified (counter = {})", count);
+}
+
+/// Verify the async executor's spawn → poll → wake → poll lifecycle.
+///
+/// Spawns a custom future that returns `Pending` on its first poll
+/// (storing its [`Waker`] in a global) and `Ready(())` on the second.
+/// Between the two polls, we manually wake the future — simulating
+/// what an IRQ handler would do. This is fully deterministic: no
+/// timer dependency, just two polls and one wake.
+fn test_async_executor() {
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use core::task::{Context, Poll, Waker};
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static POLL_COUNT: AtomicU32 = AtomicU32::new(0);
+    static TEST_WAKER: spin::Mutex<Option<Waker>> = spin::Mutex::new(None);
+
+    struct TestFuture;
+
+    impl Future for TestFuture {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let count = POLL_COUNT.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                // First poll: stash the waker so the test can wake us later.
+                *TEST_WAKER.lock() = Some(cx.waker().clone());
+                Poll::Pending
+            } else {
+                // Second poll: signal completion.
+                DONE.store(true, Ordering::SeqCst);
+                Poll::Ready(())
+            }
+        }
+    }
+
+    // Reset statics in case the test runs more than once.
+    DONE.store(false, Ordering::SeqCst);
+    POLL_COUNT.store(0, Ordering::SeqCst);
+    *TEST_WAKER.lock() = None;
+
+    executor::spawn(TestFuture);
+    executor::poll_once(); // first poll → Pending, waker stored
+
+    assert_eq!(POLL_COUNT.load(Ordering::SeqCst), 1);
+    assert!(!DONE.load(Ordering::SeqCst));
+
+    // Simulate an IRQ waking the future. wake() requires IF=0.
+    arch::Arch::disable_interrupts();
+    TEST_WAKER.lock().take().unwrap().wake();
+    arch::Arch::enable_interrupts();
+
+    let completed = executor::poll_once(); // second poll → Ready
+
+    assert!(DONE.load(Ordering::SeqCst));
+    assert_eq!(POLL_COUNT.load(Ordering::SeqCst), 2);
+    assert_eq!(completed, 1);
+
+    // poll_once() leaves IF=1. Restore IF=0 for subsequent code.
+    arch::Arch::disable_interrupts();
+
+    println!("[ok] Async executor verified (future spawned, woken, completed in 2 polls)");
 }

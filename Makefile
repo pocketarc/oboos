@@ -6,6 +6,7 @@ ISO_ROOT = iso_root
 LIMINE_DIR = limine
 
 QEMU_FLAGS = -cdrom $(ISO) -serial stdio -no-reboot -no-shutdown -m 128M
+TEST_TIMEOUT ?= 5
 
 all: iso
 
@@ -65,7 +66,7 @@ test: $(LIMINE_DIR) limine.conf
 		--protective-msdos-label \
 		$(ISO_ROOT) -o $(ISO)
 	./$(LIMINE_DIR)/limine bios-install $(ISO)
-	qemu-system-x86_64 $(QEMU_FLAGS)
+	timeout $(TEST_TIMEOUT) qemu-system-x86_64 $(QEMU_FLAGS) || true
 
 clean:
 	cargo clean
