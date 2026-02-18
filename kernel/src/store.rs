@@ -57,7 +57,7 @@ use core::task::Waker;
 
 use crate::arch::Arch;
 use crate::platform::Platform;
-use oboos_api::{FieldDef, StoreSchema, Value};
+use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
 
 /// Opaque store identifier — monotonic, never reused.
 ///
@@ -236,6 +236,22 @@ pub fn get(store: StoreId, field: &str) -> Result<Value, StoreError> {
 /// which expects IF=0 for the `sysretq` instruction.
 pub(crate) fn get_no_cli(store: StoreId, field: &str) -> Result<Value, StoreError> {
     get_inner(store, field)
+}
+
+/// Look up a field's [`FieldKind`] from the schema without reading its value.
+///
+/// Used by the syscall handler to interpret raw bytes from userspace
+/// according to the field's declared type. Runs without touching the
+/// interrupt flag (same rationale as [`get_no_cli`]).
+pub(crate) fn field_kind_no_cli(store: StoreId, field: &str) -> Result<FieldKind, StoreError> {
+    let reg = registry().lock();
+    let instance = reg.stores.get(&store.0).ok_or(StoreError::NotFound)?;
+    let field_def = instance
+        .fields
+        .iter()
+        .find(|f| f.name == field)
+        .ok_or(StoreError::UnknownField)?;
+    Ok(field_def.kind.clone())
 }
 
 fn get_inner(store: StoreId, field: &str) -> Result<Value, StoreError> {

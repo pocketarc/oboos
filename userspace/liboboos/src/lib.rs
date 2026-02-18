@@ -4,15 +4,23 @@
 //! all Ring 3 programs. Any code that a second userspace binary would need
 //! to copy-paste belongs here instead of in the application.
 //!
-//! ## Syscall convention
+//! ## Syscall interface
 //!
-//! Follows the Linux register convention for SYSCALL:
-//! - RAX = syscall number
-//! - RDI = arg1, RSI = arg2, RDX = arg3, R10 = arg4
-//! - Return value in RAX
+//! Only two syscalls exist — everything is expressed through the store:
 //!
-//! SYSCALL clobbers RCX (saves RIP) and R11 (saves RFLAGS), so both
-//! must be listed as clobbers in the inline asm.
+//! | # | Name          | Args                                                  | Returns            |
+//! |---|---------------|-------------------------------------------------------|--------------------|
+//! | 0 | SYS_STORE_GET | store_id, field_ptr, field_len, out_ptr, out_len      | bytes written      |
+//! | 1 | SYS_STORE_SET | store_id, field_ptr, field_len, value_ptr, value_len  | 0 on success       |
+//!
+//! Both use 5 arguments passed in RDI, RSI, RDX, R10, R8 (Linux convention).
+//! SYSCALL clobbers RCX (saves RIP) and R11 (saves RFLAGS).
+//!
+//! ## Well-known store IDs
+//!
+//! Bit 63 flags well-known stores resolved per-process by the kernel:
+//! - [`PROCESS`] — current process's lifecycle store (pid, status, exit_code)
+//! - [`CONSOLE`] — serial console device store (write "output" to print)
 
 #![no_std]
 
@@ -20,94 +28,33 @@
 // Syscall numbers — must match kernel/src/arch/x86_64/syscall.rs
 // ————————————————————————————————————————————————————————————————————————————
 
-pub const SYS_EXIT: u64 = 0;
-pub const SYS_WRITE: u64 = 1;
-pub const SYS_STORE_GET: u64 = 2;
-pub const SYS_STORE_SET: u64 = 3;
-pub const SYS_GETPID: u64 = 4;
+pub const SYS_STORE_GET: u64 = 0;
+pub const SYS_STORE_SET: u64 = 1;
 
 // ————————————————————————————————————————————————————————————————————————————
-// Raw syscall wrappers
+// Well-known store IDs
 // ————————————————————————————————————————————————————————————————————————————
 
-/// Syscall with no arguments (just the number).
-#[inline(always)]
-pub fn syscall0(number: u64) -> u64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rax") number,
-            lateout("rax") ret,
-            out("rcx") _,
-            out("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
+/// The current process's lifecycle store. The kernel resolves this to the
+/// process store created by `process::spawn()`, containing fields like
+/// `pid` (U64), `name` (Str), `status` (Str), and `exit_code` (U64).
+pub const PROCESS: u64 = 1 << 63;
 
-/// Syscall with 1 argument.
-#[inline(always)]
-pub fn syscall1(number: u64, arg1: u64) -> u64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rax") number,
-            in("rdi") arg1,
-            lateout("rax") ret,
-            out("rcx") _,
-            out("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
+/// The serial console device store. Writing to the `"output"` field (Str)
+/// triggers a side-effect: the kernel writes the raw bytes to the serial port.
+pub const CONSOLE: u64 = (1 << 63) | 1;
 
-/// Syscall with 2 arguments.
-#[inline(always)]
-pub fn syscall2(number: u64, arg1: u64, arg2: u64) -> u64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rax") number,
-            in("rdi") arg1,
-            in("rsi") arg2,
-            lateout("rax") ret,
-            out("rcx") _,
-            out("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
+// ————————————————————————————————————————————————————————————————————————————
+// Raw syscall wrapper
+// ————————————————————————————————————————————————————————————————————————————
 
-/// Syscall with 3 arguments.
+/// Syscall with 5 arguments — the only raw syscall needed, since both
+/// SYS_STORE_GET and SYS_STORE_SET take exactly 5 args.
+///
+/// Register mapping follows the Linux SYSCALL convention:
+/// RAX = number, RDI = arg1, RSI = arg2, RDX = arg3, R10 = arg4, R8 = arg5.
 #[inline(always)]
-pub fn syscall3(number: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rax") number,
-            in("rdi") arg1,
-            in("rsi") arg2,
-            in("rdx") arg3,
-            lateout("rax") ret,
-            out("rcx") _,
-            out("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-/// Syscall with 4 arguments. R10 carries arg4 (not RCX, because SYSCALL
-/// clobbers RCX with the return address).
-#[inline(always)]
-pub fn syscall4(number: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
+pub fn syscall5(number: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> u64 {
     let ret: u64;
     unsafe {
         core::arch::asm!(
@@ -117,6 +64,7 @@ pub fn syscall4(number: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 
             in("rsi") arg2,
             in("rdx") arg3,
             in("r10") arg4,
+            in("r8") arg5,
             lateout("rax") ret,
             out("rcx") _,
             out("r11") _,
@@ -130,30 +78,79 @@ pub fn syscall4(number: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 
 // High-level syscall wrappers
 // ————————————————————————————————————————————————————————————————————————————
 
-/// Write a string to the serial console via SYS_WRITE.
-pub fn write(msg: &str) {
-    syscall2(SYS_WRITE, msg.as_ptr() as u64, msg.len() as u64);
-}
-
 /// Read a U64 value from a store field via SYS_STORE_GET.
+///
+/// Provides an 8-byte output buffer and interprets the result as a native-
+/// endian `u64`. Works for any U64 field (e.g. pid, exit_code, counters).
 pub fn store_get(store_id: u64, field: &str) -> u64 {
-    syscall3(SYS_STORE_GET, store_id, field.as_ptr() as u64, field.len() as u64)
+    let mut val: u64 = 0;
+    syscall5(
+        SYS_STORE_GET,
+        store_id,
+        field.as_ptr() as u64,
+        field.len() as u64,
+        &mut val as *mut u64 as u64,
+        8,
+    );
+    val
 }
 
 /// Write a U64 value to a store field via SYS_STORE_SET.
+///
+/// Sends the 8 native-endian bytes of `value`. The kernel looks up the
+/// field's schema type (must be U64) and constructs the Value internally.
 pub fn store_set(store_id: u64, field: &str, value: u64) -> u64 {
-    syscall4(SYS_STORE_SET, store_id, field.as_ptr() as u64, field.len() as u64, value)
+    let bytes = value.to_ne_bytes();
+    syscall5(
+        SYS_STORE_SET,
+        store_id,
+        field.as_ptr() as u64,
+        field.len() as u64,
+        bytes.as_ptr() as u64,
+        8,
+    )
 }
 
-/// Get the current process's PID via SYS_GETPID.
+/// Write a string value to a store field via SYS_STORE_SET.
+///
+/// Sends the raw UTF-8 bytes. The kernel looks up the field's schema type
+/// (must be Str) and constructs the Value internally.
+pub fn store_set_str(store_id: u64, field: &str, value: &str) -> u64 {
+    syscall5(
+        SYS_STORE_SET,
+        store_id,
+        field.as_ptr() as u64,
+        field.len() as u64,
+        value.as_ptr() as u64,
+        value.len() as u64,
+    )
+}
+
+/// Write a string to the serial console.
+///
+/// Sets the `"output"` field on the [`CONSOLE`] well-known store. The kernel
+/// triggers a side-effect that writes the raw bytes to the serial port.
+pub fn write(msg: &str) {
+    store_set_str(CONSOLE, "output", msg);
+}
+
+/// Get the current process's PID.
+///
+/// Reads the `"pid"` field from the [`PROCESS`] well-known store.
 pub fn getpid() -> u64 {
-    syscall0(SYS_GETPID)
+    store_get(PROCESS, "pid")
 }
 
 /// Exit the program with an exit code, returning control to the kernel.
+///
+/// Sets `exit_code` on the process store, then sets `status` to `"exiting"`.
+/// The kernel detects the status write as a side-effect trigger: it reads
+/// the exit code, transitions the process to Exited, and longjmps back to
+/// whoever called `jump_to_ring3`. The second syscall never returns.
 pub fn exit(code: u64) -> ! {
-    syscall1(SYS_EXIT, code);
-    // Safety net — SYS_EXIT never returns, but the compiler doesn't know that.
+    store_set(PROCESS, "exit_code", code);
+    store_set_str(PROCESS, "status", "exiting");
+    // The kernel's exit side-effect longjmps — this is a safety net.
     loop {}
 }
 

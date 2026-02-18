@@ -93,7 +93,10 @@ pub fn run_ring3_smoke_test() {
         arch::gdt::set_rsp0(kern_stack_rsp);
     }
 
-    // ── Step 5: Create the application data store ──────────────────
+    // ── Step 5: Create the console and application data stores ─────
+    let console_store_id = arch::syscall::create_console_store();
+    println!("[user] Created console store (id={})", console_store_id.as_raw());
+
     let data_store_id = store::create::<UserTestSchema>(&[
         ("counter", Value::U64(0)),
     ]).expect("create user test store");
@@ -129,6 +132,7 @@ pub fn run_ring3_smoke_test() {
     println!("[ok] Process store verified (status=exited, exit_code=0)");
 
     // ── Step 9: Clean up ───────────────────────────────────────────
+    arch::syscall::destroy_console_store(console_store_id);
     store::destroy(data_store_id).expect("destroy user test store");
     process::destroy(pid);
     loaded.unload();

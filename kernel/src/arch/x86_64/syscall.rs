@@ -18,24 +18,47 @@
 //! - **IA32_LSTAR** (0xC0000082): the kernel entry point address
 //! - **IA32_FMASK** (0xC0000084): RFLAGS bits to clear on entry (we clear IF)
 //!
+//! ## Syscall interface
+//!
+//! Only two syscalls exist — everything is expressed through the store:
+//!
+//! | # | Name          | Args                                                  | Returns            |
+//! |---|---------------|-------------------------------------------------------|--------------------|
+//! | 0 | SYS_STORE_GET | store_id, field_ptr, field_len, out_ptr, out_len      | bytes written      |
+//! | 1 | SYS_STORE_SET | store_id, field_ptr, field_len, value_ptr, value_len  | 0 on success       |
+//!
+//! Both return `u64::MAX` on error. The kernel uses the field's [`FieldKind`]
+//! from the schema to interpret raw bytes — no type information crosses the
+//! syscall boundary.
+//!
+//! ## Well-known store IDs
+//!
+//! Bit 63 flags well-known stores resolved per-process by the kernel:
+//! - `PROCESS` (1 << 63) — current process's lifecycle store
+//! - `CONSOLE` ((1 << 63) | 1) — serial console device store
+//!
+//! ## Side-effects
+//!
+//! SET on certain well-known store fields triggers kernel actions:
+//! - `CONSOLE`/`"output"` → bytes written to serial inline
+//! - `PROCESS`/`"status"` = `"exiting"` → reads `exit_code`, triggers process
+//!   exit and longjmp back to [`jump_to_ring3`]'s caller
+//!
 //! ## Register convention
 //!
-//! User programs pass syscall arguments in registers following the Linux
-//! convention (RAX=number, RDI/RSI/RDX/R10=args). The entry stub shuffles
-//! these into the System V AMD64 calling convention before calling the
+//! User programs pass 5 syscall arguments in registers following the Linux
+//! convention. The entry stub shuffles these into System V AMD64 for the
 //! Rust handler:
 //!
 //! ```text
 //! User register → Handler parameter
-//! RAX (number)  → RDI
-//! RDI (arg1)    → RSI
-//! RSI (arg2)    → RDX
-//! RDX (arg3)    → RCX
-//! R10 (arg4)    → R8
+//! RAX (number)  → RDI (param 1)
+//! RDI (arg1)    → RSI (param 2)
+//! RSI (arg2)    → RDX (param 3)
+//! RDX (arg3)    → RCX (param 4)
+//! R10 (arg4)    → R8  (param 5)
+//! R8  (arg5)    → R9  (param 6)
 //! ```
-//!
-//! The handler returns a `u64` in RAX which flows back to the user
-//! untouched via `sysretq`.
 //!
 //! ## Critical SYSRET pitfall
 //!
@@ -45,11 +68,16 @@
 //! controlled register. Linux mitigates this by checking RCX before SYSRET.
 //! Our user code is at 0x40_0000 (canonical), so we're safe for now.
 
+extern crate alloc;
+
+use alloc::string::String;
 use core::arch::naked_asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::platform::SerialConsole;
+use crate::process;
 use crate::store::{self, StoreId};
-use oboos_api::Value;
+use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
 
 // ————————————————————————————————————————————————————————————————————————————
 // MSR addresses
@@ -67,11 +95,83 @@ const EFER_SCE: u64 = 1 << 0;
 // Syscall numbers
 // ————————————————————————————————————————————————————————————————————————————
 
-const SYS_EXIT: u64 = 0;
-const SYS_WRITE: u64 = 1;
-const SYS_STORE_GET: u64 = 2;
-const SYS_STORE_SET: u64 = 3;
-const SYS_GETPID: u64 = 4;
+const SYS_STORE_GET: u64 = 0;
+const SYS_STORE_SET: u64 = 1;
+
+// ————————————————————————————————————————————————————————————————————————————
+// Well-known store IDs
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Bit 63 set means the store ID is a well-known kernel-resolved alias
+/// rather than a direct store registry index.
+const WELL_KNOWN_BIT: u64 = 1 << 63;
+
+// ————————————————————————————————————————————————————————————————————————————
+// Console store
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Schema for the console device store — a single string field that triggers
+/// serial output as a side-effect when written.
+struct ConsoleSchema;
+
+impl StoreSchema for ConsoleSchema {
+    fn name() -> &'static str { "Console" }
+    fn fields() -> &'static [FieldDef] {
+        &[FieldDef { name: "output", kind: FieldKind::Str }]
+    }
+}
+
+/// The real [`StoreId`] of the console store. Set by [`create_console_store`],
+/// cleared by [`destroy_console_store`]. `u64::MAX` means no console store
+/// exists yet.
+static CONSOLE_STORE_ID: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Create the console store and register its ID in the global.
+///
+/// Must be called before entering Ring 3 so that userspace `write()` calls
+/// (which SET on `CONSOLE`/`"output"`) have a store to resolve to.
+pub fn create_console_store() -> StoreId {
+    let id = store::create::<ConsoleSchema>(&[
+        ("output", Value::Str(String::from(""))),
+    ]).expect("create console store");
+    CONSOLE_STORE_ID.store(id.as_raw(), Ordering::Relaxed);
+    id
+}
+
+/// Unregister and destroy the console store.
+pub fn destroy_console_store(id: StoreId) {
+    CONSOLE_STORE_ID.store(u64::MAX, Ordering::Relaxed);
+    store::destroy(id).expect("destroy console store");
+}
+
+/// Read the current console store ID, if one exists.
+fn console_store_id() -> Option<StoreId> {
+    let raw = CONSOLE_STORE_ID.load(Ordering::Relaxed);
+    if raw == u64::MAX { None } else { Some(StoreId::from_raw(raw)) }
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// Well-known store ID resolution
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Resolve a user-provided store ID to an internal [`StoreId`].
+///
+/// If bit 63 is set, the lower bits select a well-known store:
+/// - 0 → current process's lifecycle store (via [`process::store_id`])
+/// - 1 → console device store (via [`console_store_id`])
+///
+/// If bit 63 is clear, the raw value is used directly as a store registry ID.
+fn resolve_store_id(raw: u64) -> Option<StoreId> {
+    if raw & WELL_KNOWN_BIT != 0 {
+        match raw & !WELL_KNOWN_BIT {
+            0 => process::store_id(process::current_pid()),
+            1 => console_store_id(),
+            _ => None,
+        }
+    } else {
+        Some(StoreId::from_raw(raw))
+    }
+}
 
 // ————————————————————————————————————————————————————————————————————————————
 // MSR helpers
@@ -128,9 +228,10 @@ static mut SAVED_USER_RSP: u64 = 0;
 /// before entering Ring 3.
 static mut KERNEL_RSP: u64 = 0;
 
-/// Saved kernel context for the SYS_EXIT return path. When the user program
-/// calls SYS_EXIT, the handler restores these registers and RSP to return
-/// control to whoever called [`jump_to_ring3`].
+/// Saved kernel context for the process exit return path. When the user
+/// program triggers exit (by setting PROCESS/"status" to "exiting"), the
+/// handler restores these registers and RSP to return control to whoever
+/// called [`jump_to_ring3`].
 ///
 /// Layout: `[rsp, rbx, rbp, r12, r13, r14, r15]` — same callee-saved
 /// register set as our context switch, stored via `mov` (not `push`) so
@@ -221,23 +322,24 @@ fn validate_user_ptr(ptr: u64, len: u64) -> bool {
 /// - CS/SS = kernel selectors (loaded by SYSCALL hardware)
 /// - RSP = **unchanged** (still the user stack!)
 /// - RAX = syscall number
-/// - RDI = arg1, RSI = arg2, RDX = arg3, R10 = arg4
+/// - RDI = arg1, RSI = arg2, RDX = arg3, R10 = arg4, R8 = arg5
 ///
 /// We must immediately swap to a kernel stack before doing anything that
 /// touches the stack (like calling a Rust function).
 ///
-/// The register shuffle maps the Linux syscall convention to System V
-/// AMD64 calling convention for the Rust handler. R9 is used as scratch
-/// because the 4-register rotation (RAX→RDI→RSI→RDX) has a cycle that
-/// needs breaking:
+/// The register shuffle maps the Linux syscall convention (5 args) to
+/// System V AMD64 calling convention for the 6-param Rust handler.
+/// R9 is now needed for arg5 (param 6), so we use push/pop to save
+/// arg1 through the RDI→param1 overwrite:
 ///
 /// ```text
-/// mov r9, rdi      ; save arg1 (RDI is about to be overwritten)
-/// mov rdi, rax     ; number → 1st param
-/// mov r8, r10      ; arg4 → 5th param (no conflict)
-/// mov rcx, rdx     ; arg3 → 4th param (must happen before RDX overwritten)
-/// mov rdx, rsi     ; arg2 → 3rd param
-/// mov rsi, r9      ; arg1 → 2nd param
+/// push rdi          ; save arg1 (RDI about to become syscall number)
+/// mov r9, r8        ; arg5 → param 6 (before R8 overwritten)
+/// mov rdi, rax      ; number → param 1
+/// mov r8, r10       ; arg4 → param 5
+/// mov rcx, rdx      ; arg3 → param 4 (before RDX overwritten)
+/// mov rdx, rsi      ; arg2 → param 3
+/// pop rsi           ; arg1 → param 2
 /// ```
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry() {
@@ -255,13 +357,14 @@ unsafe extern "C" fn syscall_entry() {
         "push rbp",
         "mov rbp, rsp",
 
-        // Shuffle registers: Linux syscall convention → System V ABI.
-        "mov r9, rdi",       // save user arg1
+        // Shuffle registers: Linux syscall convention (5 args) → System V ABI (6 params).
+        "push rdi",          // save user arg1 (RDI about to become syscall number)
+        "mov r9, r8",        // arg5 → param 6 (must happen before R8 overwritten)
         "mov rdi, rax",      // syscall number → param 1
         "mov r8, r10",       // arg4 → param 5
         "mov rcx, rdx",      // arg3 → param 4 (before rdx overwritten)
         "mov rdx, rsi",      // arg2 → param 3
-        "mov rsi, r9",       // arg1 → param 2
+        "pop rsi",           // arg1 → param 2
 
         "call {handler}",
 
@@ -292,99 +395,206 @@ unsafe extern "C" fn syscall_entry() {
 /// Called from [`syscall_entry`] with interrupts disabled (FMASK clears IF).
 /// Arguments arrive in System V order after the entry stub's register shuffle.
 ///
-/// ## Syscall table
-///
-/// | Number | Name          | Args                          | Returns          |
-/// |--------|---------------|-------------------------------|------------------|
-/// | 0      | SYS_EXIT      | exit_code                     | never returns    |
-/// | 1      | SYS_WRITE     | buf_ptr, buf_len              | bytes written    |
-/// | 2      | SYS_STORE_GET | store_id, field_ptr, field_len | u64 value        |
-/// | 3      | SYS_STORE_SET | store_id, field_ptr, field_len, value | 0 or error |
-/// | 4      | SYS_GETPID    | —                             | current PID      |
-extern "C" fn syscall_handler(number: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
+/// Only two syscalls exist — GET and SET. Everything (process identity,
+/// console output, process exit) is expressed through well-known store IDs
+/// and side-effects triggered by specific field writes.
+extern "C" fn syscall_handler(
+    number: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
+) -> u64 {
     match number {
-        SYS_EXIT => {
-            let exit_code = arg1;
-            crate::process::exit(crate::process::current_pid(), exit_code);
-            unsafe { restore_return_context(); }
-        },
-
-        SYS_GETPID => {
-            crate::process::current_pid().as_raw()
-        },
-
-        SYS_WRITE => {
-            let buf_ptr = arg1;
-            let buf_len = arg2;
-
-            if !validate_user_ptr(buf_ptr, buf_len) {
-                return u64::MAX; // error: bad pointer
-            }
-
-            let slice = unsafe {
-                core::slice::from_raw_parts(buf_ptr as *const u8, buf_len as usize)
-            };
-
-            for &b in slice {
-                crate::arch::Serial::write_byte(b);
-            }
-            buf_len
-        }
-
-        SYS_STORE_GET => {
-            let store_id = arg1;
-            let field_ptr = arg2;
-            let field_len = arg3;
-
-            if !validate_user_ptr(field_ptr, field_len) {
-                return u64::MAX;
-            }
-
-            let field_bytes = unsafe {
-                core::slice::from_raw_parts(field_ptr as *const u8, field_len as usize)
-            };
-            let field_name = match core::str::from_utf8(field_bytes) {
-                Ok(s) => s,
-                Err(_) => return u64::MAX,
-            };
-
-            let id = StoreId::from_raw(store_id);
-            match store::get_no_cli(id, field_name) {
-                Ok(Value::U64(v)) => v,
-                _ => u64::MAX,
-            }
-        }
-
-        SYS_STORE_SET => {
-            let store_id = arg1;
-            let field_ptr = arg2;
-            let field_len = arg3;
-            let value = arg4;
-
-            if !validate_user_ptr(field_ptr, field_len) {
-                return u64::MAX;
-            }
-
-            let field_bytes = unsafe {
-                core::slice::from_raw_parts(field_ptr as *const u8, field_len as usize)
-            };
-            let field_name = match core::str::from_utf8(field_bytes) {
-                Ok(s) => s,
-                Err(_) => return u64::MAX,
-            };
-
-            let id = StoreId::from_raw(store_id);
-            match store::set_no_cli(id, &[(field_name, Value::U64(value))]) {
-                Ok(()) => 0,
-                Err(_) => u64::MAX,
-            }
-        }
-
+        SYS_STORE_GET => handle_store_get(arg1, arg2, arg3, arg4, arg5),
+        SYS_STORE_SET => handle_store_set(arg1, arg2, arg3, arg4, arg5),
         _ => {
             crate::println!("[syscall] unknown: {}", number);
             u64::MAX
         }
     }
+}
+
+/// Handle SYS_STORE_GET (syscall 0).
+///
+/// Reads a field from a store and serializes the value into the caller's
+/// output buffer. The kernel uses the field's [`FieldKind`] from the schema
+/// to determine the byte representation:
+/// - `U64` → 8 bytes, native endian
+/// - `Str` → UTF-8 bytes (truncated if buffer too small)
+/// - `Bool` → 1 byte (0 or 1)
+///
+/// Returns the number of bytes written, or `u64::MAX` on error.
+fn handle_store_get(
+    store_id_raw: u64, field_ptr: u64, field_len: u64, out_ptr: u64, out_len: u64,
+) -> u64 {
+    if !validate_user_ptr(field_ptr, field_len) || !validate_user_ptr(out_ptr, out_len) {
+        return u64::MAX;
+    }
+
+    let field_bytes = unsafe {
+        core::slice::from_raw_parts(field_ptr as *const u8, field_len as usize)
+    };
+    let field_name = match core::str::from_utf8(field_bytes) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+
+    let id = match resolve_store_id(store_id_raw) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    let value = match store::get_no_cli(id, field_name) {
+        Ok(v) => v,
+        Err(_) => return u64::MAX,
+    };
+
+    // Serialize the value into the caller's output buffer.
+    let out_buf = unsafe {
+        core::slice::from_raw_parts_mut(out_ptr as *mut u8, out_len as usize)
+    };
+
+    match value {
+        Value::U64(v) => {
+            if out_buf.len() < 8 { return u64::MAX; }
+            out_buf[..8].copy_from_slice(&v.to_ne_bytes());
+            8
+        }
+        Value::I64(v) => {
+            if out_buf.len() < 8 { return u64::MAX; }
+            out_buf[..8].copy_from_slice(&v.to_ne_bytes());
+            8
+        }
+        Value::U32(v) => {
+            if out_buf.len() < 4 { return u64::MAX; }
+            out_buf[..4].copy_from_slice(&v.to_ne_bytes());
+            4
+        }
+        Value::Str(ref s) => {
+            let src = s.as_bytes();
+            let copy_len = src.len().min(out_buf.len());
+            out_buf[..copy_len].copy_from_slice(&src[..copy_len]);
+            copy_len as u64
+        }
+        Value::Bool(b) => {
+            if out_buf.is_empty() { return u64::MAX; }
+            out_buf[0] = b as u8;
+            1
+        }
+        Value::U8(v) => {
+            if out_buf.is_empty() { return u64::MAX; }
+            out_buf[0] = v;
+            1
+        }
+    }
+}
+
+/// Handle SYS_STORE_SET (syscall 1).
+///
+/// Interprets raw bytes from the caller according to the field's [`FieldKind`]
+/// and writes the resulting [`Value`] to the store. After a successful write,
+/// checks for side-effects:
+///
+/// - **Console output:** if the store is [`CONSOLE`] and the field is `"output"`,
+///   writes the raw value bytes to the serial port.
+/// - **Process exit:** if the store is the current process's lifecycle store,
+///   the field is `"status"`, and the value is `"exiting"`, reads `exit_code`
+///   from the process store, calls [`process::exit`], and longjmps back to
+///   the kernel via [`restore_return_context`] (never returns to userspace).
+///
+/// Returns 0 on success, `u64::MAX` on error.
+fn handle_store_set(
+    store_id_raw: u64, field_ptr: u64, field_len: u64, value_ptr: u64, value_len: u64,
+) -> u64 {
+    if !validate_user_ptr(field_ptr, field_len) || !validate_user_ptr(value_ptr, value_len) {
+        return u64::MAX;
+    }
+
+    let field_bytes = unsafe {
+        core::slice::from_raw_parts(field_ptr as *const u8, field_len as usize)
+    };
+    let field_name = match core::str::from_utf8(field_bytes) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+
+    let id = match resolve_store_id(store_id_raw) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    // Look up the field's type from the schema so we know how to
+    // interpret the raw bytes.
+    let kind = match store::field_kind_no_cli(id, field_name) {
+        Ok(k) => k,
+        Err(_) => return u64::MAX,
+    };
+
+    let value_bytes = unsafe {
+        core::slice::from_raw_parts(value_ptr as *const u8, value_len as usize)
+    };
+
+    // Interpret the raw bytes according to the schema's declared type.
+    let value = match kind {
+        FieldKind::U64 => {
+            if value_bytes.len() != 8 { return u64::MAX; }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(value_bytes);
+            Value::U64(u64::from_ne_bytes(buf))
+        }
+        FieldKind::I64 => {
+            if value_bytes.len() != 8 { return u64::MAX; }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(value_bytes);
+            Value::I64(i64::from_ne_bytes(buf))
+        }
+        FieldKind::U32 => {
+            if value_bytes.len() != 4 { return u64::MAX; }
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(value_bytes);
+            Value::U32(u32::from_ne_bytes(buf))
+        }
+        FieldKind::Str => {
+            match core::str::from_utf8(value_bytes) {
+                Ok(s) => Value::Str(String::from(s)),
+                Err(_) => return u64::MAX,
+            }
+        }
+        FieldKind::Bool => {
+            if value_bytes.len() != 1 { return u64::MAX; }
+            Value::Bool(value_bytes[0] != 0)
+        }
+        FieldKind::U8 => {
+            if value_bytes.len() != 1 { return u64::MAX; }
+            Value::U8(value_bytes[0])
+        }
+    };
+
+    if store::set_no_cli(id, &[(field_name, value)]).is_err() {
+        return u64::MAX;
+    }
+
+    // ── Side-effects ──────────────────────────────────────────────────
+
+    // Console output: write the raw value bytes to serial.
+    if console_store_id() == Some(id) && field_name == "output" {
+        for &b in value_bytes {
+            crate::arch::Serial::write_byte(b);
+        }
+    }
+
+    // Process exit: if userspace set status to "exiting" on its own
+    // process store, read the exit_code and trigger the exit path.
+    let pid = process::current_pid();
+    if let Some(proc_store) = process::store_id(pid) {
+        if proc_store == id && field_name == "status" && value_bytes == b"exiting" {
+            let exit_code = match store::get_no_cli(id, "exit_code") {
+                Ok(Value::U64(v)) => v,
+                _ => 0,
+            };
+            process::exit(pid, exit_code);
+            unsafe { restore_return_context(); }
+        }
+    }
+
+    0
 }
 
 // ————————————————————————————————————————————————————————————————————————————
@@ -393,7 +603,7 @@ extern "C" fn syscall_handler(number: u64, arg1: u64, arg2: u64, arg3: u64, arg4
 
 /// Restore callee-saved registers and RSP from [`RETURN_CONTEXT`], then `ret`.
 ///
-/// This is the "longjmp" half of the SYS_EXIT mechanism. It restores the
+/// This is the "longjmp" half of the process exit mechanism. It restores the
 /// register state saved by [`jump_to_ring3`] and executes `ret`, which pops
 /// the return address that was on the stack when `jump_to_ring3` was called
 /// (pushed by the `call` instruction). Execution resumes in the caller of
@@ -437,10 +647,10 @@ pub fn set_kernel_rsp(rsp: u64) {
 /// 1. Save callee-saved registers + RSP to [`RETURN_CONTEXT`] (the "setjmp")
 /// 2. Build the iretq frame and execute `iretq` to enter Ring 3
 ///
-/// When the user program calls SYS_EXIT, [`restore_return_context`] loads
-/// the saved context and executes `ret`, which pops the return address
-/// that the `call jump_to_ring3` instruction pushed. The caller sees
-/// `jump_to_ring3` "return" normally.
+/// When the user program triggers process exit (by setting PROCESS/"status"
+/// to "exiting"), [`restore_return_context`] loads the saved context and
+/// executes `ret`, which pops the return address that the `call jump_to_ring3`
+/// instruction pushed. The caller sees `jump_to_ring3` "return" normally.
 ///
 /// ## iretq frame layout (bottom to top on stack)
 ///
