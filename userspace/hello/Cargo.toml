@@ -3,6 +3,9 @@ name = "oboos-hello"
 version = "0.0.1"
 edition = "2024"
 
+[dependencies]
+liboboos = { path = "../liboboos" }
+
 [profile.dev]
 panic = "abort"
 

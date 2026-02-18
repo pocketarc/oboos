@@ -1,6 +1,6 @@
 [workspace]
 members = ["api", "kernel"]
-exclude = ["userspace/hello"]
+exclude = ["userspace/hello", "userspace/liboboos"]
 resolver = "2"
 
 [profile.dev]
