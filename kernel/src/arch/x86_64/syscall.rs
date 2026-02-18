@@ -71,6 +71,7 @@ const SYS_EXIT: u64 = 0;
 const SYS_WRITE: u64 = 1;
 const SYS_STORE_GET: u64 = 2;
 const SYS_STORE_SET: u64 = 3;
+const SYS_GETPID: u64 = 4;
 
 // ————————————————————————————————————————————————————————————————————————————
 // MSR helpers
@@ -295,14 +296,21 @@ unsafe extern "C" fn syscall_entry() {
 ///
 /// | Number | Name          | Args                          | Returns          |
 /// |--------|---------------|-------------------------------|------------------|
-/// | 0      | SYS_EXIT      | —                             | never returns    |
+/// | 0      | SYS_EXIT      | exit_code                     | never returns    |
 /// | 1      | SYS_WRITE     | buf_ptr, buf_len              | bytes written    |
 /// | 2      | SYS_STORE_GET | store_id, field_ptr, field_len | u64 value        |
 /// | 3      | SYS_STORE_SET | store_id, field_ptr, field_len, value | 0 or error |
+/// | 4      | SYS_GETPID    | —                             | current PID      |
 extern "C" fn syscall_handler(number: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
     match number {
-        SYS_EXIT => unsafe {
-            restore_return_context();
+        SYS_EXIT => {
+            let exit_code = arg1;
+            crate::process::exit(crate::process::current_pid(), exit_code);
+            unsafe { restore_return_context(); }
+        },
+
+        SYS_GETPID => {
+            crate::process::current_pid().as_raw()
         },
 
         SYS_WRITE => {

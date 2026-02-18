@@ -15,6 +15,7 @@ mod executor;
 mod framebuffer;
 mod heap;
 mod memory;
+mod process;
 mod platform;
 mod scheduler;
 mod store;
@@ -131,6 +132,10 @@ extern "C" fn kmain() -> ! {
 
     // Initialize the store registry — reactive state trees for IPC.
     store::init();
+
+    // Initialize the process table — tracks userspace processes and their
+    // lifecycle stores. Depends on the store registry for creating process stores.
+    process::init();
 
     // Initialize the cooperative scheduler — wraps kmain as the bootstrap task.
     scheduler::init();

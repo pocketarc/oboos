@@ -7,7 +7,7 @@
 //!
 //! Run with `make test`. The normal `make run` skips these entirely.
 
-use crate::{arch, executor, memory, println, scheduler, store, timer, userspace};
+use crate::{arch, executor, memory, println, process, scheduler, store, timer, userspace};
 use crate::arch::TaskContext;
 use crate::platform::Platform;
 
@@ -28,6 +28,8 @@ pub fn run_all() {
     test_store_basic();
     test_store_validation();
     test_store_subscribe();
+    test_process_lifecycle();
+    test_process_store_watch();
     test_ring3();
     println!();
     println!("[ok] All smoke tests passed");
@@ -707,6 +709,122 @@ fn test_store_subscribe() {
 
     store::destroy(id).expect("cleanup watch store");
     println!("[ok] Store subscription verified (watch wakes on set)");
+}
+
+/// Verify the process table and process store lifecycle without touching Ring 3.
+///
+/// Tests the full spawn → start → exit → destroy cycle purely from the
+/// kernel side, verifying that each state transition correctly updates the
+/// process store fields.
+fn test_process_lifecycle() {
+    use alloc::string::String;
+    use oboos_api::Value;
+
+    // Spawn — creates PID and process store in "created" state.
+    let pid = process::spawn("test-proc");
+    let sid = process::store_id(pid).expect("process should have a store");
+
+    // Verify initial state.
+    assert_eq!(store::get(sid, "status").unwrap(), Value::Str(String::from("created")));
+    assert_eq!(store::get(sid, "pid").unwrap(), Value::U64(pid.as_raw()));
+    assert_eq!(store::get(sid, "name").unwrap(), Value::Str(String::from("test-proc")));
+    assert_eq!(store::get(sid, "exit_code").unwrap(), Value::U64(0));
+
+    // Start — Created → Running.
+    process::start(pid);
+    assert_eq!(store::get(sid, "status").unwrap(), Value::Str(String::from("running")));
+
+    // Exit — Running → Exited with code 42.
+    // exit() uses set_no_cli, so we need IF=0. Tests already run with IF=0.
+    process::exit(pid, 42);
+    assert_eq!(store::get(sid, "status").unwrap(), Value::Str(String::from("exited")));
+    assert_eq!(store::get(sid, "exit_code").unwrap(), Value::U64(42));
+
+    // Destroy — removes from table and destroys the store.
+    process::destroy(pid);
+    assert!(store::get(sid, "status").is_err(), "store should be gone after destroy");
+
+    println!("[ok] Process lifecycle verified (spawn \u{2192} start \u{2192} exit \u{2192} destroy)");
+}
+
+/// Verify that store subscriptions work for observing process lifecycle
+/// transitions — the key Phase 3c proof.
+///
+/// Spawns a process, watches its `status` field, triggers a state transition,
+/// and verifies the watcher observes the new value.
+fn test_process_store_watch() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use alloc::string::String;
+    use oboos_api::Value;
+
+    static WATCH_DONE: AtomicBool = AtomicBool::new(false);
+    static SAW_RUNNING: AtomicBool = AtomicBool::new(false);
+    WATCH_DONE.store(false, Ordering::SeqCst);
+    SAW_RUNNING.store(false, Ordering::SeqCst);
+
+    let pid = process::spawn("watched-proc");
+    let sid = process::store_id(pid).expect("process should have a store");
+
+    // Spawn a watcher that waits for a status change, reads the new value.
+    executor::spawn(async move {
+        if store::watch(sid, &["status"]).await.is_err() {
+            panic!("watch failed");
+        }
+        match store::get(sid, "status") {
+            Ok(Value::Str(s)) if s == "running" => {
+                SAW_RUNNING.store(true, Ordering::SeqCst);
+            }
+            other => panic!("expected status=running, got {:?}", other),
+        }
+        WATCH_DONE.store(true, Ordering::SeqCst);
+    });
+
+    // First poll: watcher subscribes, returns Pending.
+    executor::poll_once();
+    assert!(!WATCH_DONE.load(Ordering::SeqCst), "watcher should be pending");
+
+    // Transition to Running — wakes the watcher.
+    process::start(pid);
+
+    // Second poll: watcher reads "running" and completes.
+    let completed = executor::poll_once();
+    assert!(WATCH_DONE.load(Ordering::SeqCst), "watcher should be done");
+    assert!(SAW_RUNNING.load(Ordering::SeqCst), "watcher should have seen running");
+    assert_eq!(completed, 1);
+
+    // Now test the exit transition with a second watcher.
+    static WATCH_DONE2: AtomicBool = AtomicBool::new(false);
+    static SAW_EXITED: AtomicBool = AtomicBool::new(false);
+    WATCH_DONE2.store(false, Ordering::SeqCst);
+    SAW_EXITED.store(false, Ordering::SeqCst);
+
+    executor::spawn(async move {
+        if store::watch(sid, &["status"]).await.is_err() {
+            panic!("watch failed");
+        }
+        match store::get(sid, "status") {
+            Ok(Value::Str(s)) if s == "exited" => {
+                SAW_EXITED.store(true, Ordering::SeqCst);
+            }
+            other => panic!("expected status=exited, got {:?}", other),
+        }
+        WATCH_DONE2.store(true, Ordering::SeqCst);
+    });
+
+    // First poll: second watcher subscribes.
+    executor::poll_once();
+    assert!(!WATCH_DONE2.load(Ordering::SeqCst));
+
+    // Exit the process — wakes the second watcher.
+    process::exit(pid, 0);
+
+    // Second poll: watcher reads "exited" and completes.
+    executor::poll_once();
+    assert!(WATCH_DONE2.load(Ordering::SeqCst));
+    assert!(SAW_EXITED.load(Ordering::SeqCst));
+
+    process::destroy(pid);
+    println!("[ok] Process store watch verified (status transitions observable)");
 }
 
 /// Verify the Ring 3 store round trip: load an ELF, drop to user mode,
