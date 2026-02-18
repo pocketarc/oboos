@@ -28,6 +28,7 @@
 
 use crate::arch;
 use crate::elf;
+use crate::executor;
 use crate::memory;
 use crate::platform::{MemoryManager, PageFlags};
 use crate::println;
@@ -96,6 +97,11 @@ pub fn run_ring3_smoke_test() {
     // ── Step 5: Create the console and application data stores ─────
     let console_store_id = arch::syscall::create_console_store();
     println!("[user] Created console store (id={})", console_store_id.as_raw());
+
+    // Spawn the async console driver and do an initial poll so its
+    // watch() registers a subscriber before userspace starts writing.
+    executor::spawn(arch::syscall::console_driver());
+    executor::poll_once();
 
     let data_store_id = store::create::<UserTestSchema>(&[
         ("counter", Value::U64(0)),

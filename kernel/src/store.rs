@@ -386,6 +386,146 @@ fn destroy_inner(store: StoreId) -> Result<(), StoreError> {
     Ok(())
 }
 
+// ————————————————————————————————————————————————————————————————————————————
+// Queue operations
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Push a value onto a Queue field.
+///
+/// Validates that the field is a `Queue(inner)` and that the value matches
+/// the inner kind. Appends to the back of the deque, then fires wakers on
+/// any subscribers watching this field — same drain-and-wake pattern as
+/// [`set()`].
+pub fn push(store: StoreId, field: &str, value: Value) -> Result<(), StoreError> {
+    Arch::disable_interrupts();
+    let result = push_inner(store, field, value);
+    Arch::enable_interrupts();
+    result
+}
+
+/// Push without touching the interrupt flag (syscall path).
+pub(crate) fn push_no_cli(store: StoreId, field: &str, value: Value) -> Result<(), StoreError> {
+    push_inner(store, field, value)
+}
+
+fn push_inner(store: StoreId, field: &str, value: Value) -> Result<(), StoreError> {
+    let wakers = {
+        let mut reg = registry().lock();
+        let instance = reg.stores.get_mut(&store.0).ok_or(StoreError::NotFound)?;
+
+        let field_def = instance
+            .fields
+            .iter()
+            .find(|f| f.name == field)
+            .ok_or(StoreError::UnknownField)?;
+
+        let inner_kind = match &field_def.kind {
+            FieldKind::Queue(inner) => *inner,
+            _ => return Err(StoreError::TypeMismatch),
+        };
+
+        if !value.matches(inner_kind) {
+            return Err(StoreError::TypeMismatch);
+        }
+
+        // Append to the queue.
+        match instance.data.get_mut(field) {
+            Some(Value::Queue(deque)) => deque.push_back(value),
+            _ => return Err(StoreError::TypeMismatch),
+        }
+
+        // Wake subscribers watching this field.
+        let mut wakers = Vec::new();
+        let mut i = 0;
+        while i < instance.subscribers.len() {
+            if instance.subscribers[i].fields.contains(&field) {
+                wakers.push(instance.subscribers.swap_remove(i).waker);
+            } else {
+                i += 1;
+            }
+        }
+        wakers
+    }; // registry lock dropped here
+
+    for w in wakers {
+        w.wake();
+    }
+    Ok(())
+}
+
+/// Pop the front element from a Queue field.
+///
+/// Returns `Ok(Some(value))` if the queue had an element, `Ok(None)` if
+/// empty. Does not fire wakers — this is a consumer-side operation.
+pub fn pop(store: StoreId, field: &str) -> Result<Option<Value>, StoreError> {
+    Arch::disable_interrupts();
+    let result = pop_inner(store, field);
+    Arch::enable_interrupts();
+    result
+}
+
+/// Pop without touching the interrupt flag (syscall path).
+pub(crate) fn pop_no_cli(store: StoreId, field: &str) -> Result<Option<Value>, StoreError> {
+    pop_inner(store, field)
+}
+
+fn pop_inner(store: StoreId, field: &str) -> Result<Option<Value>, StoreError> {
+    let mut reg = registry().lock();
+    let instance = reg.stores.get_mut(&store.0).ok_or(StoreError::NotFound)?;
+
+    let field_def = instance
+        .fields
+        .iter()
+        .find(|f| f.name == field)
+        .ok_or(StoreError::UnknownField)?;
+
+    if !matches!(field_def.kind, FieldKind::Queue(_)) {
+        return Err(StoreError::TypeMismatch);
+    }
+
+    match instance.data.get_mut(field) {
+        Some(Value::Queue(deque)) => Ok(deque.pop_front()),
+        _ => Err(StoreError::TypeMismatch),
+    }
+}
+
+/// Drain all elements from a Queue field, returning them as a Vec.
+///
+/// Returns an empty Vec if the queue was already empty. Does not fire
+/// wakers — this is a consumer-side operation.
+pub fn drain(store: StoreId, field: &str) -> Result<Vec<Value>, StoreError> {
+    Arch::disable_interrupts();
+    let result = drain_inner(store, field);
+    Arch::enable_interrupts();
+    result
+}
+
+/// Drain without touching the interrupt flag (syscall path).
+#[allow(dead_code)]
+pub(crate) fn drain_no_cli(store: StoreId, field: &str) -> Result<Vec<Value>, StoreError> {
+    drain_inner(store, field)
+}
+
+fn drain_inner(store: StoreId, field: &str) -> Result<Vec<Value>, StoreError> {
+    let mut reg = registry().lock();
+    let instance = reg.stores.get_mut(&store.0).ok_or(StoreError::NotFound)?;
+
+    let field_def = instance
+        .fields
+        .iter()
+        .find(|f| f.name == field)
+        .ok_or(StoreError::UnknownField)?;
+
+    if !matches!(field_def.kind, FieldKind::Queue(_)) {
+        return Err(StoreError::TypeMismatch);
+    }
+
+    match instance.data.get_mut(field) {
+        Some(Value::Queue(deque)) => Ok(deque.drain(..).collect()),
+        _ => Err(StoreError::TypeMismatch),
+    }
+}
+
 /// Register a subscriber for one or more fields (private).
 ///
 /// Validates that every field exists in the schema, then pushes a

@@ -43,8 +43,10 @@ pub struct FieldDef {
 
 /// The type of a store field.
 ///
-/// Flat — no recursive variants. `List` and `Map` come in a later layer
-/// when subscriptions need nested stores.
+/// Scalar variants are flat values. `Queue` is the first collection type:
+/// a FIFO queue parameterized by its element kind. SET on a Queue field
+/// pushes one element; GET pops one. No new syscalls needed — the store
+/// schema drives the behavior.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldKind {
     Bool,
@@ -53,4 +55,9 @@ pub enum FieldKind {
     U64,
     I64,
     Str,
+    /// A FIFO queue whose elements must match the inner [`FieldKind`].
+    ///
+    /// The `&'static` reference works because schemas are always defined
+    /// as static data (`fn fields() -> &'static [FieldDef]`).
+    Queue(&'static FieldKind),
 }

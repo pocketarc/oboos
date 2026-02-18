@@ -37,10 +37,14 @@
 //! - `PROCESS` (1 << 63) — current process's lifecycle store
 //! - `CONSOLE` ((1 << 63) | 1) — serial console device store
 //!
-//! ## Side-effects
+//! ## Side-effects and async processing
 //!
-//! SET on certain well-known store fields triggers kernel actions:
-//! - `CONSOLE`/`"output"` → bytes written to serial inline
+//! SET triggers a [`poll_once()`] at the end of every successful write,
+//! allowing async tasks to react before the syscall returns. The console
+//! driver is one such task — it watches `CONSOLE`/`"output"` (a Queue(Str)
+//! field) and drains messages to serial.
+//!
+//! The only synchronous side-effect left is process exit:
 //! - `PROCESS`/`"status"` = `"exiting"` → reads `exit_code`, triggers process
 //!   exit and longjmp back to [`jump_to_ring3`]'s caller
 //!
@@ -70,11 +74,12 @@
 
 extern crate alloc;
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use core::arch::naked_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::platform::SerialConsole;
+use crate::platform::{Platform, SerialConsole};
 use crate::process;
 use crate::store::{self, StoreId};
 use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
@@ -110,14 +115,18 @@ const WELL_KNOWN_BIT: u64 = 1 << 63;
 // Console store
 // ————————————————————————————————————————————————————————————————————————————
 
-/// Schema for the console device store — a single string field that triggers
-/// serial output as a side-effect when written.
+/// Schema for the console device store — a string queue that the async
+/// console driver drains to serial.
+///
+/// SET on `"output"` pushes a string onto the queue (schema-driven
+/// behavior — no special-case code in the syscall handler). The console
+/// driver watches the queue and writes bytes to serial.
 struct ConsoleSchema;
 
 impl StoreSchema for ConsoleSchema {
     fn name() -> &'static str { "Console" }
     fn fields() -> &'static [FieldDef] {
-        &[FieldDef { name: "output", kind: FieldKind::Str }]
+        &[FieldDef { name: "output", kind: FieldKind::Queue(&FieldKind::Str) }]
     }
 }
 
@@ -132,7 +141,7 @@ static CONSOLE_STORE_ID: AtomicU64 = AtomicU64::new(u64::MAX);
 /// (which SET on `CONSOLE`/`"output"`) have a store to resolve to.
 pub fn create_console_store() -> StoreId {
     let id = store::create::<ConsoleSchema>(&[
-        ("output", Value::Str(String::from(""))),
+        ("output", Value::Queue(VecDeque::new())),
     ]).expect("create console store");
     CONSOLE_STORE_ID.store(id.as_raw(), Ordering::Relaxed);
     id
@@ -148,6 +157,33 @@ pub fn destroy_console_store(id: StoreId) {
 fn console_store_id() -> Option<StoreId> {
     let raw = CONSOLE_STORE_ID.load(Ordering::Relaxed);
     if raw == u64::MAX { None } else { Some(StoreId::from_raw(raw)) }
+}
+
+/// Async console driver — watches the console store's output queue and
+/// drains pending messages to serial.
+///
+/// This replaces the synchronous console side-effect that was previously
+/// hard-coded in `handle_store_set`. The driver uses the same `watch()`
+/// mechanism as other reactive tasks (sysmon_renderer, display_task).
+/// `poll_once()` at the end of every SYS_STORE_SET ensures the driver
+/// runs before the syscall returns to userspace.
+pub async fn console_driver() {
+    let id = match console_store_id() {
+        Some(id) => id,
+        None => return,
+    };
+    loop {
+        if store::watch(id, &["output"]).await.is_err() {
+            return;
+        }
+        for item in store::drain(id, "output").unwrap_or_default() {
+            if let Value::Str(s) = item {
+                for &b in s.as_bytes() {
+                    crate::arch::Serial::write_byte(b);
+                }
+            }
+        }
+    }
 }
 
 // ————————————————————————————————————————————————————————————————————————————
@@ -411,14 +447,98 @@ extern "C" fn syscall_handler(
     }
 }
 
+// ————————————————————————————————————————————————————————————————————————————
+// Value serialization helpers
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Interpret raw bytes from userspace as a scalar [`Value`] according to
+/// the field's declared type.
+///
+/// Returns `None` for `Queue` kinds — queue pushes deserialize by the
+/// inner kind, not the queue kind itself.
+fn deserialize_value(kind: &FieldKind, bytes: &[u8]) -> Option<Value> {
+    match kind {
+        FieldKind::U64 => {
+            if bytes.len() != 8 { return None; }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(bytes);
+            Some(Value::U64(u64::from_ne_bytes(buf)))
+        }
+        FieldKind::I64 => {
+            if bytes.len() != 8 { return None; }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(bytes);
+            Some(Value::I64(i64::from_ne_bytes(buf)))
+        }
+        FieldKind::U32 => {
+            if bytes.len() != 4 { return None; }
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(bytes);
+            Some(Value::U32(u32::from_ne_bytes(buf)))
+        }
+        FieldKind::Str => {
+            core::str::from_utf8(bytes)
+                .ok()
+                .map(|s| Value::Str(String::from(s)))
+        }
+        FieldKind::Bool => {
+            if bytes.len() != 1 { return None; }
+            Some(Value::Bool(bytes[0] != 0))
+        }
+        FieldKind::U8 => {
+            if bytes.len() != 1 { return None; }
+            Some(Value::U8(bytes[0]))
+        }
+        FieldKind::Queue(_) => None,
+    }
+}
+
+/// Serialize a scalar [`Value`] into a byte buffer.
+///
+/// Returns the number of bytes written, or `None` for `Queue` values
+/// (which can't be serialized as a single blob).
+fn serialize_value(value: &Value, out_buf: &mut [u8]) -> Option<u64> {
+    match value {
+        Value::U64(v) => {
+            if out_buf.len() < 8 { return None; }
+            out_buf[..8].copy_from_slice(&v.to_ne_bytes());
+            Some(8)
+        }
+        Value::I64(v) => {
+            if out_buf.len() < 8 { return None; }
+            out_buf[..8].copy_from_slice(&v.to_ne_bytes());
+            Some(8)
+        }
+        Value::U32(v) => {
+            if out_buf.len() < 4 { return None; }
+            out_buf[..4].copy_from_slice(&v.to_ne_bytes());
+            Some(4)
+        }
+        Value::Str(s) => {
+            let src = s.as_bytes();
+            let copy_len = src.len().min(out_buf.len());
+            out_buf[..copy_len].copy_from_slice(&src[..copy_len]);
+            Some(copy_len as u64)
+        }
+        Value::Bool(b) => {
+            if out_buf.is_empty() { return None; }
+            out_buf[0] = *b as u8;
+            Some(1)
+        }
+        Value::U8(v) => {
+            if out_buf.is_empty() { return None; }
+            out_buf[0] = *v;
+            Some(1)
+        }
+        Value::Queue(_) => None,
+    }
+}
+
 /// Handle SYS_STORE_GET (syscall 0).
 ///
 /// Reads a field from a store and serializes the value into the caller's
-/// output buffer. The kernel uses the field's [`FieldKind`] from the schema
-/// to determine the byte representation:
-/// - `U64` → 8 bytes, native endian
-/// - `Str` → UTF-8 bytes (truncated if buffer too small)
-/// - `Bool` → 1 byte (0 or 1)
+/// output buffer. For scalar fields, reads the current value. For Queue
+/// fields, pops the front element (returns 0 bytes if the queue is empty).
 ///
 /// Returns the number of bytes written, or `u64::MAX` on error.
 fn handle_store_get(
@@ -441,47 +561,30 @@ fn handle_store_get(
         None => return u64::MAX,
     };
 
-    let value = match store::get_no_cli(id, field_name) {
-        Ok(v) => v,
+    let kind = match store::field_kind_no_cli(id, field_name) {
+        Ok(k) => k,
         Err(_) => return u64::MAX,
     };
 
-    // Serialize the value into the caller's output buffer.
     let out_buf = unsafe {
         core::slice::from_raw_parts_mut(out_ptr as *mut u8, out_len as usize)
     };
 
-    match value {
-        Value::U64(v) => {
-            if out_buf.len() < 8 { return u64::MAX; }
-            out_buf[..8].copy_from_slice(&v.to_ne_bytes());
-            8
+    match kind {
+        FieldKind::Queue(_) => {
+            // Pop one element from the queue. Empty queue → 0 bytes.
+            match store::pop_no_cli(id, field_name) {
+                Ok(Some(value)) => serialize_value(&value, out_buf).unwrap_or(u64::MAX),
+                Ok(None) => 0,
+                Err(_) => u64::MAX,
+            }
         }
-        Value::I64(v) => {
-            if out_buf.len() < 8 { return u64::MAX; }
-            out_buf[..8].copy_from_slice(&v.to_ne_bytes());
-            8
-        }
-        Value::U32(v) => {
-            if out_buf.len() < 4 { return u64::MAX; }
-            out_buf[..4].copy_from_slice(&v.to_ne_bytes());
-            4
-        }
-        Value::Str(ref s) => {
-            let src = s.as_bytes();
-            let copy_len = src.len().min(out_buf.len());
-            out_buf[..copy_len].copy_from_slice(&src[..copy_len]);
-            copy_len as u64
-        }
-        Value::Bool(b) => {
-            if out_buf.is_empty() { return u64::MAX; }
-            out_buf[0] = b as u8;
-            1
-        }
-        Value::U8(v) => {
-            if out_buf.is_empty() { return u64::MAX; }
-            out_buf[0] = v;
-            1
+        _ => {
+            let value = match store::get_no_cli(id, field_name) {
+                Ok(v) => v,
+                Err(_) => return u64::MAX,
+            };
+            serialize_value(&value, out_buf).unwrap_or(u64::MAX)
         }
     }
 }
@@ -489,15 +592,12 @@ fn handle_store_get(
 /// Handle SYS_STORE_SET (syscall 1).
 ///
 /// Interprets raw bytes from the caller according to the field's [`FieldKind`]
-/// and writes the resulting [`Value`] to the store. After a successful write,
-/// checks for side-effects:
+/// and writes the resulting [`Value`] to the store. For scalar fields, this is
+/// a normal `set`. For Queue fields, the value is pushed onto the back.
 ///
-/// - **Console output:** if the store is [`CONSOLE`] and the field is `"output"`,
-///   writes the raw value bytes to the serial port.
-/// - **Process exit:** if the store is the current process's lifecycle store,
-///   the field is `"status"`, and the value is `"exiting"`, reads `exit_code`
-///   from the process store, calls [`process::exit`], and longjmps back to
-///   the kernel via [`restore_return_context`] (never returns to userspace).
+/// After a successful write, checks for the process-exit side-effect, then
+/// calls [`poll_once()`] to let async tasks (like the console driver) process
+/// the new data before returning to userspace.
 ///
 /// Returns 0 on success, `u64::MAX` on error.
 fn handle_store_set(
@@ -520,8 +620,6 @@ fn handle_store_set(
         None => return u64::MAX,
     };
 
-    // Look up the field's type from the schema so we know how to
-    // interpret the raw bytes.
     let kind = match store::field_kind_no_cli(id, field_name) {
         Ok(k) => k,
         Err(_) => return u64::MAX,
@@ -531,57 +629,33 @@ fn handle_store_set(
         core::slice::from_raw_parts(value_ptr as *const u8, value_len as usize)
     };
 
-    // Interpret the raw bytes according to the schema's declared type.
-    let value = match kind {
-        FieldKind::U64 => {
-            if value_bytes.len() != 8 { return u64::MAX; }
-            let mut buf = [0u8; 8];
-            buf.copy_from_slice(value_bytes);
-            Value::U64(u64::from_ne_bytes(buf))
-        }
-        FieldKind::I64 => {
-            if value_bytes.len() != 8 { return u64::MAX; }
-            let mut buf = [0u8; 8];
-            buf.copy_from_slice(value_bytes);
-            Value::I64(i64::from_ne_bytes(buf))
-        }
-        FieldKind::U32 => {
-            if value_bytes.len() != 4 { return u64::MAX; }
-            let mut buf = [0u8; 4];
-            buf.copy_from_slice(value_bytes);
-            Value::U32(u32::from_ne_bytes(buf))
-        }
-        FieldKind::Str => {
-            match core::str::from_utf8(value_bytes) {
-                Ok(s) => Value::Str(String::from(s)),
-                Err(_) => return u64::MAX,
+    // Branch on scalar vs queue: SET on a Queue field pushes one element.
+    match kind {
+        FieldKind::Queue(inner) => {
+            let value = match deserialize_value(inner, value_bytes) {
+                Some(v) => v,
+                None => return u64::MAX,
+            };
+            if store::push_no_cli(id, field_name, value).is_err() {
+                return u64::MAX;
             }
         }
-        FieldKind::Bool => {
-            if value_bytes.len() != 1 { return u64::MAX; }
-            Value::Bool(value_bytes[0] != 0)
+        _ => {
+            let value = match deserialize_value(&kind, value_bytes) {
+                Some(v) => v,
+                None => return u64::MAX,
+            };
+            if store::set_no_cli(id, &[(field_name, value)]).is_err() {
+                return u64::MAX;
+            }
         }
-        FieldKind::U8 => {
-            if value_bytes.len() != 1 { return u64::MAX; }
-            Value::U8(value_bytes[0])
-        }
-    };
-
-    if store::set_no_cli(id, &[(field_name, value)]).is_err() {
-        return u64::MAX;
     }
 
     // ── Side-effects ──────────────────────────────────────────────────
 
-    // Console output: write the raw value bytes to serial.
-    if console_store_id() == Some(id) && field_name == "output" {
-        for &b in value_bytes {
-            crate::arch::Serial::write_byte(b);
-        }
-    }
-
     // Process exit: if userspace set status to "exiting" on its own
     // process store, read the exit_code and trigger the exit path.
+    // This must be checked before poll_once() because it diverges.
     let pid = process::current_pid();
     if let Some(proc_store) = process::store_id(pid) {
         if proc_store == id && field_name == "status" && value_bytes == b"exiting" {
@@ -593,6 +667,13 @@ fn handle_store_set(
             unsafe { restore_return_context(); }
         }
     }
+
+    // Run async tasks so subscribers (like the console driver) can
+    // process the new data before we return to userspace. poll_once()
+    // manages its own interrupt state and returns with IF=1, so we
+    // must re-disable interrupts for the sysretq path.
+    crate::executor::poll_once();
+    crate::arch::Arch::disable_interrupts();
 
     0
 }

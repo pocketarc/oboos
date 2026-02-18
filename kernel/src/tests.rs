@@ -28,6 +28,8 @@ pub fn run_all() {
     test_store_basic();
     test_store_validation();
     test_store_subscribe();
+    test_store_queue();
+    test_store_queue_watch();
     test_process_lifecycle();
     test_process_store_watch();
     test_ring3();
@@ -711,6 +713,110 @@ fn test_store_subscribe() {
     println!("[ok] Store subscription verified (watch wakes on set)");
 }
 
+/// Verify Queue field operations: push, pop, drain, empty checks, type validation.
+///
+/// Creates a store with a Queue(Str) field, exercises the full FIFO lifecycle,
+/// and verifies type mismatches are rejected.
+fn test_store_queue() {
+    use alloc::string::String;
+    use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+    struct QueueSchema;
+    impl StoreSchema for QueueSchema {
+        fn name() -> &'static str { "QueueTest" }
+        fn fields() -> &'static [FieldDef] {
+            &[FieldDef { name: "msgs", kind: FieldKind::Queue(&FieldKind::Str) }]
+        }
+    }
+
+    let id = store::create::<QueueSchema>(&[
+        ("msgs", Value::Queue(alloc::collections::VecDeque::new())),
+    ]).expect("create queue store");
+
+    // Pop from empty queue returns None.
+    assert_eq!(store::pop(id, "msgs").unwrap(), None);
+
+    // Push 3 elements.
+    store::push(id, "msgs", Value::Str(String::from("a"))).expect("push a");
+    store::push(id, "msgs", Value::Str(String::from("b"))).expect("push b");
+    store::push(id, "msgs", Value::Str(String::from("c"))).expect("push c");
+
+    // Pop 2 in FIFO order.
+    assert_eq!(store::pop(id, "msgs").unwrap(), Some(Value::Str(String::from("a"))));
+    assert_eq!(store::pop(id, "msgs").unwrap(), Some(Value::Str(String::from("b"))));
+
+    // Drain remaining 1.
+    let remaining = store::drain(id, "msgs").unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0], Value::Str(String::from("c")));
+
+    // Queue is empty again.
+    assert_eq!(store::pop(id, "msgs").unwrap(), None);
+    assert!(store::drain(id, "msgs").unwrap().is_empty());
+
+    // Type mismatch: push a U32 into a Queue(Str).
+    assert!(store::push(id, "msgs", Value::U32(42)).is_err());
+
+    store::destroy(id).expect("cleanup queue store");
+    println!("[ok] Store queue operations verified (push, pop, drain, type validation)");
+}
+
+/// Verify that push on a Queue field wakes subscribers, just like set() on scalars.
+///
+/// Creates a Queue(U32) store, spawns a watcher, pushes a value, and verifies
+/// the watcher is woken and can pop the value.
+fn test_store_queue_watch() {
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+    struct QueueWatchSchema;
+    impl StoreSchema for QueueWatchSchema {
+        fn name() -> &'static str { "QueueWatch" }
+        fn fields() -> &'static [FieldDef] {
+            &[FieldDef { name: "items", kind: FieldKind::Queue(&FieldKind::U32) }]
+        }
+    }
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static RECEIVED: AtomicU32 = AtomicU32::new(0);
+    DONE.store(false, Ordering::SeqCst);
+    RECEIVED.store(0, Ordering::SeqCst);
+
+    let id = store::create::<QueueWatchSchema>(&[
+        ("items", Value::Queue(alloc::collections::VecDeque::new())),
+    ]).expect("create queue watch store");
+
+    // Spawn a future that watches the queue field.
+    executor::spawn(async move {
+        if store::watch(id, &["items"]).await.is_err() {
+            panic!("queue watch failed");
+        }
+        match store::pop(id, "items") {
+            Ok(Some(Value::U32(v))) => {
+                RECEIVED.store(v, Ordering::SeqCst);
+                DONE.store(true, Ordering::SeqCst);
+            }
+            other => panic!("unexpected pop result: {:?}", other),
+        }
+    });
+
+    // First poll: the future subscribes, returns Pending.
+    executor::poll_once();
+    assert!(!DONE.load(Ordering::SeqCst), "future should be pending after first poll");
+
+    // Push a value — this wakes the subscriber.
+    store::push(id, "items", Value::U32(99)).expect("push to queue");
+
+    // Second poll: the future pops the value and completes.
+    let completed = executor::poll_once();
+    assert!(DONE.load(Ordering::SeqCst), "future should be done after second poll");
+    assert_eq!(RECEIVED.load(Ordering::SeqCst), 99);
+    assert_eq!(completed, 1);
+
+    store::destroy(id).expect("cleanup queue watch store");
+    println!("[ok] Store queue watch verified (push wakes subscriber)");
+}
+
 /// Verify the process table and process store lifecycle without touching Ring 3.
 ///
 /// Tests the full spawn → start → exit → destroy cycle purely from the
@@ -754,7 +860,6 @@ fn test_process_lifecycle() {
 /// and verifies the watcher observes the new value.
 fn test_process_store_watch() {
     use core::sync::atomic::{AtomicBool, Ordering};
-    use alloc::string::String;
     use oboos_api::Value;
 
     static WATCH_DONE: AtomicBool = AtomicBool::new(false);
