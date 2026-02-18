@@ -89,7 +89,7 @@ impl StoreSchema for SystemMonitorSchema {
     fn name() -> &'static str { "SystemMonitor" }
     fn fields() -> &'static [FieldDef] {
         &[
-            FieldDef { name: "uptime_s", kind: FieldKind::U64 },
+            FieldDef { name: "uptime_ms", kind: FieldKind::U64 },
             FieldDef { name: "free_kb", kind: FieldKind::U64 },
         ]
     }
@@ -181,7 +181,7 @@ extern "C" fn kmain() -> ! {
             // Create the system monitor store — updated every second, watched
             // by the renderer to draw the status bar.
             let sysmon_id = store::create::<SystemMonitorSchema>(&[
-                ("uptime_s", Value::U64(0)),
+                ("uptime_ms", Value::U64(0)),
                 ("free_kb", Value::U64(0)),
             ]).expect("create sysmon store");
 
@@ -225,12 +225,12 @@ async fn sysmon_updater(store: StoreId) {
     loop {
         timer::sleep(1000).await;
 
-        let uptime_s = arch::Arch::elapsed_ms() / 1000;
+        let uptime_ms = arch::Arch::elapsed_ms();
         // Each frame is 4 KiB, so free_frames * 4 = free KiB.
         let free_kb = (memory::free_frame_count() as u64) * 4;
 
         let _ = store::set(store, &[
-            ("uptime_s", Value::U64(uptime_s)),
+            ("uptime_ms", Value::U64(uptime_ms)),
             ("free_kb", Value::U64(free_kb)),
         ]);
     }
@@ -238,16 +238,16 @@ async fn sysmon_updater(store: StoreId) {
 
 /// Async task that watches the system monitor store and draws the status bar.
 ///
-/// Watches both `uptime_s` and `free_kb` — wakes when either changes.
+/// Watches both `uptime_ms` and `free_kb` — wakes when either changes.
 /// Since the updater writes both atomically, this fires once per cycle.
 /// Reads `bg_color` from the app store to tint the bar background.
 async fn sysmon_renderer(sysmon: StoreId, app: StoreId) {
     loop {
-        if store::watch(sysmon, &["uptime_s", "free_kb"]).await.is_err() {
+        if store::watch(sysmon, &["uptime_ms", "free_kb"]).await.is_err() {
             return;
         }
 
-        let uptime_s = match store::get(sysmon, "uptime_s") {
+        let uptime_ms = match store::get(sysmon, "uptime_ms") {
             Ok(Value::U64(v)) => v,
             _ => return,
         };
@@ -261,8 +261,10 @@ async fn sysmon_renderer(sysmon: StoreId, app: StoreId) {
         };
 
         let fb = framebuffer::FRAMEBUFFER_INFO.get().unwrap();
-        draw_status_bar(fb, bg, uptime_s, free_kb);
-        println!("[sysmon] render: {}s, {} KiB free", uptime_s, free_kb);
+        draw_status_bar(fb, bg, uptime_ms, free_kb);
+        let secs = uptime_ms / 1000;
+        let frac = uptime_ms % 1000;
+        println!("[sysmon] render: {}.{:03}s, {} KiB free", secs, frac, free_kb);
     }
 }
 
@@ -417,25 +419,34 @@ fn draw_splash(fb: &FramebufferInfo, bg: framebuffer::Color) {
 
 /// Draw the status bar at the bottom of the screen.
 ///
-/// Layout: darkened background strip, left-aligned text showing uptime
-/// and free memory. The bar occupies the bottom [`STATUS_BAR_HEIGHT`]
+/// Layout: darkened background strip, left-aligned text showing uptime (with
+/// millisecond precision) and free memory. The bar occupies the bottom [`STATUS_BAR_HEIGHT`]
 /// pixels and uses a darkened version of the current background color
 /// so it visually recedes behind the main content.
-fn draw_status_bar(fb: &FramebufferInfo, bg: framebuffer::Color, uptime_s: u64, free_kb: u64) {
+fn draw_status_bar(fb: &FramebufferInfo, bg: framebuffer::Color, uptime_ms: u64, free_kb: u64) {
     let bar_bg = bg.darken();
     let bar_y = fb.height - STATUS_BAR_HEIGHT;
     framebuffer::clear_rect(fb.ptr, fb.pitch, 0, bar_y, fb.width, STATUS_BAR_HEIGHT, bar_bg);
 
-    // Format "Uptime: XXs | Free: XXX KiB" into a stack buffer.
-    let mut buf = [0u8; 64];
+    // Format "Uptime: XX.XXXs | Free: XXX KiB" into a stack buffer.
+    let mut buf = [0u8; 80];
     let mut pos = 0;
 
-    // "Uptime: "
     let prefix = b"Uptime: ";
     buf[pos..pos + prefix.len()].copy_from_slice(prefix);
     pos += prefix.len();
 
-    pos += write_u64(&mut buf[pos..], uptime_s);
+    // Whole seconds part.
+    pos += write_u64(&mut buf[pos..], uptime_ms / 1000);
+
+    // Decimal point + zero-padded milliseconds (always 3 digits).
+    buf[pos] = b'.';
+    pos += 1;
+    let frac = (uptime_ms % 1000) as u16;
+    buf[pos]     = b'0' + (frac / 100) as u8;
+    buf[pos + 1] = b'0' + ((frac / 10) % 10) as u8;
+    buf[pos + 2] = b'0' + (frac % 10) as u8;
+    pos += 3;
 
     let mid = b"s | Free: ";
     buf[pos..pos + mid.len()].copy_from_slice(mid);

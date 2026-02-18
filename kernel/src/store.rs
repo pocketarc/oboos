@@ -284,7 +284,7 @@ fn get_inner(store: StoreId, field: &str) -> Result<Value, StoreError> {
 ///
 /// // Multiple fields atomically:
 /// store::set(id, &[
-///     ("uptime_s", Value::U64(10)),
+///     ("uptime_ms", Value::U64(10_042)),
 ///     ("free_kb", Value::U64(50000)),
 /// ])?;
 /// ```
@@ -553,8 +553,8 @@ fn subscribe(store: StoreId, fields: &'static [&'static str], waker: Waker) -> R
 ///
 /// ```
 /// loop {
-///     store::watch(id, &["uptime_s", "free_kb"]).await?;
-///     let uptime = store::get(id, "uptime_s")?;
+///     store::watch(id, &["uptime_ms", "free_kb"]).await?;
+///     let uptime = store::get(id, "uptime_ms")?;
 ///     let free = store::get(id, "free_kb")?;
 ///     // react to new values
 /// }
