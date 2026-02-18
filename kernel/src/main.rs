@@ -10,6 +10,7 @@
 extern crate alloc;
 
 mod arch;
+mod elf;
 mod executor;
 mod framebuffer;
 mod heap;
@@ -19,6 +20,7 @@ mod scheduler;
 mod store;
 mod task;
 mod timer;
+mod userspace;
 #[cfg(feature = "smoke-test")]
 mod tests;
 

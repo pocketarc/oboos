@@ -7,7 +7,7 @@
 //!
 //! Run with `make test`. The normal `make run` skips these entirely.
 
-use crate::{arch, executor, memory, println, scheduler, store, timer};
+use crate::{arch, executor, memory, println, scheduler, store, timer, userspace};
 use crate::arch::TaskContext;
 use crate::platform::Platform;
 
@@ -28,6 +28,7 @@ pub fn run_all() {
     test_store_basic();
     test_store_validation();
     test_store_subscribe();
+    test_ring3();
     println!();
     println!("[ok] All smoke tests passed");
 }
@@ -706,4 +707,14 @@ fn test_store_subscribe() {
 
     store::destroy(id).expect("cleanup watch store");
     println!("[ok] Store subscription verified (watch wakes on set)");
+}
+
+/// Verify the Ring 3 store round trip: load an ELF, drop to user mode,
+/// read/write a kernel store via syscalls, and return.
+///
+/// The userspace Rust program (compiled as ELF, embedded via include_bytes)
+/// sets a store field to 42 via SYS_STORE_SET, reads it back via
+/// SYS_STORE_GET, and exits via SYS_EXIT. The kernel verifies counter==42.
+fn test_ring3() {
+    userspace::run_ring3_smoke_test();
 }

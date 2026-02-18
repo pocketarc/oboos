@@ -54,7 +54,14 @@ use core::mem::size_of;
 /// Selectors are always multiples of 8 because the bottom 3 bits are flags.
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08; // GDT index 1 — 64-bit kernel code
 const KERNEL_DATA_SELECTOR: u16 = 0x10; // GDT index 2 — kernel data
-const TSS_SELECTOR: u16 = 0x18; // GDT index 3 — TSS descriptor
+/// User data segment selector (DPL=3). Placed before user code because
+/// SYSRET loads SS = STAR[63:48] + 8 and CS = STAR[63:48] + 16 — the
+/// Intel/AMD SYSCALL convention requires data before code.
+pub const USER_DATA_SELECTOR: u16 = 0x18; // GDT index 3
+/// User code segment selector (DPL=3, Long mode). RPL=3 in the selector
+/// value (0x20 | 3 = 0x23) tells the CPU "running at ring 3."
+pub const USER_CODE_SELECTOR: u16 = 0x20; // GDT index 4
+const TSS_SELECTOR: u16 = 0x28; // GDT index 5 — TSS descriptor (moved from 0x18)
 
 // ————————————————————————————————————————————————————————————————————————————
 // Task State Segment (TSS)
@@ -137,22 +144,29 @@ static mut TSS: Tss = Tss {
     iomap_base: 0,
 };
 
-/// The GDT. 5 entries × 8 bytes = 40 bytes.
+/// The GDT. 7 entries × 8 bytes = 56 bytes.
 ///
 /// Entry layout:
 /// ```text
-/// [0] 0x00  Null descriptor     — CPU requires this, faults if you use it
-/// [1] 0x08  Kernel code (64-bit) — CS points here
-/// [2] 0x10  Kernel data          — DS/ES/SS point here
-/// [3] 0x18  TSS low 8 bytes  ─┐
-/// [4] 0x20  TSS high 8 bytes ─┘  Together form a 16-byte system descriptor
+/// [0] 0x00  Null descriptor       — CPU requires this, faults if you use it
+/// [1] 0x08  Kernel code (64-bit)  — CS points here (DPL=0)
+/// [2] 0x10  Kernel data           — DS/ES/SS point here (DPL=0)
+/// [3] 0x18  User data             — user-mode SS (DPL=3)
+/// [4] 0x20  User code (64-bit)    — user-mode CS (DPL=3, L=1)
+/// [5] 0x28  TSS low 8 bytes   ─┐
+/// [6] 0x30  TSS high 8 bytes  ─┘  Together form a 16-byte system descriptor
 /// ```
+///
+/// The STAR MSR (used by SYSCALL/SYSRET) constrains the ordering: SYSRET
+/// loads CS = STAR[63:48] + 16 and SS = STAR[63:48] + 8, so user data must
+/// come before user code. Kernel code/data at indices 1–2 are similarly
+/// constrained by SYSCALL (CS = STAR[47:32], SS = STAR[47:32] + 8).
 ///
 /// The TSS descriptor is 16 bytes because it needs to hold a full 64-bit
 /// base address. Regular segment descriptors only have room for a 32-bit
 /// base (which is ignored in long mode anyway), but system descriptors
 /// (like TSS) still use the base field, so the CPU extends it to 16 bytes.
-static mut GDT: [u64; 5] = [0; 5];
+static mut GDT: [u64; 7] = [0; 7];
 
 /// The GDT Register (GDTR) — loaded via `lgdt`.
 ///
@@ -174,7 +188,8 @@ struct GdtRegister {
 /// After this function returns:
 /// - CS points to our 64-bit kernel code segment (selector 0x08)
 /// - DS/ES/SS point to our kernel data segment (selector 0x10)
-/// - The CPU knows about our TSS (loaded via `ltr`, selector 0x18)
+/// - User data (0x18) and user code (0x20) segments are ready for Ring 3
+/// - The CPU knows about our TSS (loaded via `ltr`, selector 0x28)
 /// - IST1 in the TSS points to a dedicated 4 KiB double-fault stack
 ///
 /// This must be called before setting up the IDT, because the
@@ -241,13 +256,37 @@ pub fn init() {
         //     G=1, D/B=1 (32-bit stack ops), L=0 (L only applies to code), AVL=0
         (*gdt)[2] = 0x00CF_9200_0000_FFFF;
 
-        // Entries 3–4: TSS descriptor (16 bytes = two u64 slots).
+        // Entry 3: User data segment (selector 0x18).
+        //
+        // 0x00CF_F200_0000_FFFF:
+        //   Access byte = 0xF2:
+        //     P=1, DPL=11 (ring 3), S=1, Type=0x2 (data, writable)
+        //   Flags nibble = 0xC:
+        //     G=1, D/B=1, L=0 (L only applies to code), AVL=0
+        //
+        // Must come before user code because SYSRET loads SS from
+        // STAR[63:48]+8 (this slot) and CS from STAR[63:48]+16 (next slot).
+        (*gdt)[3] = 0x00CF_F200_0000_FFFF;
+
+        // Entry 4: User code segment (selector 0x20).
+        //
+        // 0x00AF_FA00_0000_FFFF:
+        //   Access byte = 0xFA:
+        //     P=1, DPL=11 (ring 3), S=1, Type=0xA (code, readable)
+        //   Flags nibble = 0xA:
+        //     G=1, D/B=0, L=1 (64-bit mode!), AVL=0
+        //
+        // The L bit is what keeps user code in 64-bit long mode — same
+        // role as in the kernel code segment, just with DPL=3.
+        (*gdt)[4] = 0x00AF_FA00_0000_FFFF;
+
+        // Entries 5–6: TSS descriptor (16 bytes = two u64 slots).
         //
         // System descriptors (like TSS) are different from code/data descriptors.
         // In 64-bit mode they're extended to 16 bytes so they can hold a full
         // 64-bit base address. The layout is:
         //
-        // Low 8 bytes (GDT[3]):
+        // Low 8 bytes (GDT[5]):
         //   Bits  0–15:  Limit[15:0]       — TSS size minus 1
         //   Bits 16–39:  Base[23:0]        — low 24 bits of TSS address
         //   Bits 40–47:  Access byte       — 0x89 = Present, Type 0x9 (64-bit TSS, available)
@@ -255,7 +294,7 @@ pub fn init() {
         //   Bits 52–55:  Flags             — 0 for system descriptors
         //   Bits 56–63:  Base[31:24]       — next 8 bits of TSS address
         //
-        // High 8 bytes (GDT[4]):
+        // High 8 bytes (GDT[6]):
         //   Bits  0–31:  Base[63:32]       — upper 32 bits of TSS address
         //   Bits 32–63:  Reserved (must be zero)
         let tss_addr = &raw const TSS as u64;
@@ -267,17 +306,17 @@ pub fn init() {
         low |= 0x89 << 40; // Access: present, 64-bit TSS available
         low |= ((tss_limit >> 16) & 0xF) << 48; // Limit[19:16]
         low |= ((tss_addr >> 24) & 0xFF) << 56; // Base[31:24]
-        (*gdt)[3] = low;
+        (*gdt)[5] = low;
 
         let high: u64 = tss_addr >> 32; // Base[63:32]
-        (*gdt)[4] = high;
+        (*gdt)[6] = high;
 
         // ── Step 3: Load the GDT ─────────────────────────────────────
         //
         // `lgdt` takes a pointer to a 10-byte structure: 2-byte limit
         // (table size minus 1) followed by an 8-byte base address.
         let gdtr = GdtRegister {
-            limit: (size_of::<[u64; 5]>() - 1) as u16, // 39
+            limit: (size_of::<[u64; 7]>() - 1) as u16, // 55
             base: &raw const GDT as u64,
         };
 
@@ -328,7 +367,7 @@ pub fn init() {
         // ── Step 6: Load the TSS ─────────────────────────────────────
         //
         // `ltr` (Load Task Register) tells the CPU where the TSS is.
-        // The operand is a GDT selector (0x18 = index 3), not an address.
+        // The operand is a GDT selector (0x28 = index 5), not an address.
         // After this, the CPU can read IST entries from our TSS when
         // handling interrupts.
         core::arch::asm!(
@@ -339,4 +378,21 @@ pub fn init() {
     }
 
     crate::println!("[ok] GDT loaded with TSS");
+}
+
+/// Set the Ring 0 stack pointer in the TSS.
+///
+/// When the CPU transitions from Ring 3 to Ring 0 (via interrupt or
+/// exception — SYSCALL doesn't use the TSS), it loads RSP from TSS.RSP0.
+/// This must point to a valid kernel stack before entering user mode.
+///
+/// # Safety
+///
+/// `rsp0` must point to the top of a valid, mapped kernel stack with
+/// enough space for interrupt frames. The caller must ensure this stack
+/// remains valid for the entire duration of Ring 3 execution.
+pub unsafe fn set_rsp0(rsp0: u64) {
+    unsafe {
+        (*(&raw mut TSS)).rsp[0] = rsp0;
+    }
 }

@@ -12,6 +12,7 @@ pub mod port;
 pub mod serial;
 pub mod speaker;
 pub mod switch;
+pub mod syscall;
 
 // Re-export arch types under neutral names so the kernel can use
 // `arch::Arch` and `arch::Serial` without reaching into submodules.
@@ -32,6 +33,7 @@ impl Platform for X86_64 {
         serial::Serial::init();
         gdt::init();
         interrupts::init();
+        syscall::init();
 
         // Discover physical memory and initialize the frame allocator.
         // This must happen before anything that needs to allocate frames,

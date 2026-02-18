@@ -66,6 +66,21 @@ use oboos_api::{FieldDef, StoreSchema, Value};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StoreId(u64);
 
+impl StoreId {
+    /// Reconstruct a `StoreId` from its raw `u64` representation.
+    ///
+    /// Used at the syscall boundary: userspace passes the raw ID in a
+    /// register, and the syscall handler converts it back to a typed ID.
+    pub fn from_raw(raw: u64) -> Self {
+        StoreId(raw)
+    }
+
+    /// Extract the raw `u64` value for passing across the syscall boundary.
+    pub fn as_raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// Errors returned by store operations.
 #[derive(Debug)]
 pub enum StoreError {
@@ -213,6 +228,16 @@ pub fn get(store: StoreId, field: &str) -> Result<Value, StoreError> {
     result
 }
 
+/// Read a field without touching the interrupt flag.
+///
+/// The syscall handler already runs with IF=0 (FMASK clears it on
+/// SYSCALL entry). Calling the normal `get()` would re-enable
+/// interrupts via `sti` on exit — breaking the syscall return path
+/// which expects IF=0 for the `sysretq` instruction.
+pub(crate) fn get_no_cli(store: StoreId, field: &str) -> Result<Value, StoreError> {
+    get_inner(store, field)
+}
+
 fn get_inner(store: StoreId, field: &str) -> Result<Value, StoreError> {
     let reg = registry().lock();
     let instance = reg.stores.get(&store.0).ok_or(StoreError::NotFound)?;
@@ -252,6 +277,14 @@ pub fn set(store: StoreId, updates: &[(&str, Value)]) -> Result<(), StoreError> 
     let result = set_inner(store, updates);
     Arch::enable_interrupts();
     result
+}
+
+/// Write fields without touching the interrupt flag.
+///
+/// Same rationale as [`get_no_cli`] — the syscall path runs with IF=0
+/// and must stay that way through `sysretq`.
+pub(crate) fn set_no_cli(store: StoreId, updates: &[(&str, Value)]) -> Result<(), StoreError> {
+    set_inner(store, updates)
 }
 
 fn set_inner(store: StoreId, updates: &[(&str, Value)]) -> Result<(), StoreError> {

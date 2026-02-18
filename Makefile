@@ -1,9 +1,20 @@
-.PHONY: all clean run test iso
+.PHONY: all clean run test iso userspace
 
 KERNEL_ELF = target/x86_64-unknown-none/debug/oboos-kernel
 ISO = oboos.iso
 ISO_ROOT = iso_root
 LIMINE_DIR = limine
+
+# The userspace ELF is compiled separately (own target, own linker script)
+# and embedded into the kernel binary via include_bytes!().
+USERSPACE_DIR = userspace/hello
+USERSPACE_ELF = $(USERSPACE_DIR)/target/x86_64-unknown-none/debug/oboos-hello
+
+# CARGO_ENCODED_RUSTFLAGS overrides all config-file rustflags. We need this
+# because Cargo merges rustflags arrays hierarchically, and the workspace
+# root's .cargo/config.toml sets the kernel's linker script. The \x1f byte
+# is the separator between flags (Cargo's internal encoding).
+USERSPACE_RUSTFLAGS = -Crelocation-model=static$(shell printf '\037')-Clink-arg=-Tlinker.ld
 
 QEMU_FLAGS = -cdrom $(ISO) -serial stdio -no-reboot -no-shutdown -m 128M \
 	-audiodev coreaudio,id=audio0 -machine pcspk-audiodev=audio0
@@ -16,10 +27,14 @@ $(LIMINE_DIR):
 	git clone https://github.com/limine-bootloader/limine.git --branch=v8.x-binary --depth=1
 	$(MAKE) -C $(LIMINE_DIR)
 
+# Build the userspace ELF binary.
+userspace:
+	cd $(USERSPACE_DIR) && CARGO_ENCODED_RUSTFLAGS="$(USERSPACE_RUSTFLAGS)" cargo build
+
 # Assemble a bootable ISO from whatever kernel ELF is currently built.
 # Declared .PHONY so it always runs — Cargo's own fingerprinting decides
 # whether to recompile, and we always re-pack the ISO to match.
-iso: $(LIMINE_DIR) limine.conf
+iso: $(LIMINE_DIR) limine.conf userspace
 	cargo build
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
@@ -47,7 +62,7 @@ run: iso
 # Build with smoke tests enabled and boot in QEMU.
 # Cargo tracks features in its fingerprint, so switching between
 # `make run` and `make test` always triggers the right recompile.
-test: $(LIMINE_DIR) limine.conf
+test: $(LIMINE_DIR) limine.conf userspace
 	cargo build --features smoke-test
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
@@ -71,4 +86,5 @@ test: $(LIMINE_DIR) limine.conf
 
 clean:
 	cargo clean
+	cd $(USERSPACE_DIR) && cargo clean
 	rm -rf $(ISO_ROOT) $(ISO)
