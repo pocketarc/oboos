@@ -1,10 +1,9 @@
 //! Kernel store registry — reactive state trees for IPC.
 //!
 //! The store is OBOOS's future IPC primitive: a shared, schema-validated
-//! state tree that processes read, write, and (eventually) subscribe to.
-//! This Layer 0 implements the data structure groundwork — create, get,
-//! set, destroy — with schema validation on every write. No subscriptions,
-//! no capabilities, no persistence yet.
+//! state tree that processes read, write, and subscribe to. This layer
+//! adds field-level subscriptions with [`Waker`] integration, enabling
+//! async tasks to reactively watch store fields.
 //!
 //! ## Design
 //!
@@ -17,13 +16,47 @@
 //! Store IDs are monotonic `u64` values, never reused. This avoids the
 //! ABA problem where a destroyed store's ID gets recycled and a stale
 //! handle silently writes to a different store.
+//!
+//! ## Subscriptions
+//!
+//! [`watch()`] returns a one-shot future that resolves the next time any
+//! of the watched fields is written via [`set()`]. Use it in a loop for
+//! persistent watching. When `set()` updates fields, it drains all
+//! matching subscribers and wakes them after releasing the registry lock.
+//!
+//! ## Atomicity
+//!
+//! [`set()`] accepts multiple field/value pairs and writes them all under
+//! a single lock acquisition. Validation is all-or-nothing: if any field
+//! fails (unknown name, type mismatch), no fields are written. This
+//! guarantees observers always see a consistent snapshot.
+//!
+//! ## Lock ordering
+//!
+//! Registry lock → executor lock. This is safe because the executor
+//! releases its lock before polling futures (futures are removed from
+//! the task map before `poll()`). The `set()` path collects wakers
+//! under the registry lock, drops it, then calls `wake()` which takes
+//! the executor lock — never both at once.
+//!
+//! ## Interrupt safety
+//!
+//! All public functions bracket their registry access with `cli`/`sti`
+//! because `set()` calls `wake()`, and wakers push to the executor's
+//! wake queue (which the PIT tick handler also touches). Same pattern
+//! as [`crate::timer`] and [`crate::executor`].
 
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt;
+use core::future::Future;
+use core::task::Waker;
 
+use crate::arch::Arch;
+use crate::platform::Platform;
 use oboos_api::{FieldDef, StoreSchema, Value};
 
 /// Opaque store identifier — monotonic, never reused.
@@ -54,12 +87,23 @@ impl fmt::Display for StoreError {
     }
 }
 
-/// A live store instance: schema metadata + current field values.
+/// A registered subscriber waiting for any of its watched fields to change.
+///
+/// Each [`watch()`] call creates exactly one subscriber, regardless of
+/// how many fields are watched. This prevents duplicate wakes when
+/// [`set()`] writes multiple watched fields atomically.
+struct Subscriber {
+    fields: &'static [&'static str],
+    waker: Waker,
+}
+
+/// A live store instance: schema metadata + current field values + subscribers.
 struct StoreInstance {
     fields: &'static [FieldDef],
     #[allow(dead_code)]
     schema_name: &'static str,
     data: BTreeMap<String, Value>,
+    subscribers: Vec<Subscriber>,
 }
 
 /// The global store registry — all live store instances keyed by ID.
@@ -110,6 +154,13 @@ pub fn init() {
 /// ])?;
 /// ```
 pub fn create<S: StoreSchema>(defaults: &[(&str, Value)]) -> Result<StoreId, StoreError> {
+    Arch::disable_interrupts();
+    let result = create_inner::<S>(defaults);
+    Arch::enable_interrupts();
+    result
+}
+
+fn create_inner<S: StoreSchema>(defaults: &[(&str, Value)]) -> Result<StoreId, StoreError> {
     let fields = S::fields();
     let schema_name = S::name();
 
@@ -146,6 +197,9 @@ pub fn create<S: StoreSchema>(defaults: &[(&str, Value)]) -> Result<StoreId, Sto
             fields,
             schema_name,
             data,
+            // Pre-allocate subscriber slots so wakers don't hit the allocator
+            // on the hot path.
+            subscribers: Vec::with_capacity(8),
         },
     );
     Ok(StoreId(id))
@@ -153,6 +207,13 @@ pub fn create<S: StoreSchema>(defaults: &[(&str, Value)]) -> Result<StoreId, Sto
 
 /// Read a field's current value (cloned out).
 pub fn get(store: StoreId, field: &str) -> Result<Value, StoreError> {
+    Arch::disable_interrupts();
+    let result = get_inner(store, field);
+    Arch::enable_interrupts();
+    result
+}
+
+fn get_inner(store: StoreId, field: &str) -> Result<Value, StoreError> {
     let reg = registry().lock();
     let instance = reg.stores.get(&store.0).ok_or(StoreError::NotFound)?;
 
@@ -167,36 +228,184 @@ pub fn get(store: StoreId, field: &str) -> Result<Value, StoreError> {
     Ok(instance.data[field].clone())
 }
 
-/// Write a new value to a field, with schema validation.
+/// Write one or more field values atomically, with schema validation.
 ///
-/// Rejects unknown fields ([`StoreError::UnknownField`]) and type
-/// mismatches ([`StoreError::TypeMismatch`]) before mutating anything.
-pub fn set(store: StoreId, field: &str, value: Value) -> Result<(), StoreError> {
-    let mut reg = registry().lock();
-    let instance = reg.stores.get_mut(&store.0).ok_or(StoreError::NotFound)?;
+/// All fields are validated before any writes happen — if any field is
+/// unknown or has a type mismatch, the entire call fails and nothing
+/// changes. After a successful write, all subscribers watching any of
+/// the written fields are woken.
+///
+/// # Examples
+///
+/// ```
+/// // Single field:
+/// store::set(id, &[("count", Value::U32(42))])?;
+///
+/// // Multiple fields atomically:
+/// store::set(id, &[
+///     ("uptime_s", Value::U64(10)),
+///     ("free_kb", Value::U64(50000)),
+/// ])?;
+/// ```
+pub fn set(store: StoreId, updates: &[(&str, Value)]) -> Result<(), StoreError> {
+    Arch::disable_interrupts();
+    let result = set_inner(store, updates);
+    Arch::enable_interrupts();
+    result
+}
 
-    let field_def = instance
-        .fields
-        .iter()
-        .find(|f| f.name == field)
-        .ok_or(StoreError::UnknownField)?;
+fn set_inner(store: StoreId, updates: &[(&str, Value)]) -> Result<(), StoreError> {
+    // Collect wakers under the registry lock, then fire them after
+    // releasing it. This avoids holding registry + executor locks
+    // simultaneously (see module-level lock ordering docs).
+    let wakers = {
+        let mut reg = registry().lock();
+        let instance = reg.stores.get_mut(&store.0).ok_or(StoreError::NotFound)?;
 
-    if !value.matches(&field_def.kind) {
-        return Err(StoreError::TypeMismatch);
+        // Validate all fields before writing any (all-or-nothing).
+        for &(field, ref value) in updates {
+            let field_def = instance
+                .fields
+                .iter()
+                .find(|f| f.name == field)
+                .ok_or(StoreError::UnknownField)?;
+
+            if !value.matches(&field_def.kind) {
+                return Err(StoreError::TypeMismatch);
+            }
+        }
+
+        // All valid — write them all.
+        for &(field, ref value) in updates {
+            instance.data.insert(String::from(field), value.clone());
+        }
+
+        // Drain subscribers whose watched fields overlap with the written
+        // fields. Each subscriber is a single entry (even if watching
+        // multiple fields), so one wake per watch() call.
+        let mut wakers = Vec::new();
+        let mut i = 0;
+        while i < instance.subscribers.len() {
+            let sub_fields = instance.subscribers[i].fields;
+            if updates.iter().any(|&(f, _)| sub_fields.contains(&f)) {
+                wakers.push(instance.subscribers.swap_remove(i).waker);
+            } else {
+                i += 1;
+            }
+        }
+        wakers
+    }; // registry lock dropped here
+
+    for w in wakers {
+        w.wake();
     }
-
-    instance.data.insert(String::from(field), value);
     Ok(())
 }
 
 /// Destroy a store instance, freeing its data.
 ///
 /// After this call, any `get`/`set`/`destroy` with this ID returns
-/// [`StoreError::NotFound`]. The ID is never reused.
+/// [`StoreError::NotFound`]. The ID is never reused. All active
+/// subscribers are woken so their futures can detect the store is gone
+/// (they'll get `NotFound` on their next poll).
 pub fn destroy(store: StoreId) -> Result<(), StoreError> {
+    Arch::disable_interrupts();
+    let result = destroy_inner(store);
+    Arch::enable_interrupts();
+    result
+}
+
+fn destroy_inner(store: StoreId) -> Result<(), StoreError> {
+    let wakers = {
+        let mut reg = registry().lock();
+        let instance = reg
+            .stores
+            .remove(&store.0)
+            .ok_or(StoreError::NotFound)?;
+
+        // Wake all subscribers so their futures can observe NotFound.
+        instance
+            .subscribers
+            .into_iter()
+            .map(|s| s.waker)
+            .collect::<Vec<_>>()
+    }; // registry lock dropped here
+
+    for w in wakers {
+        w.wake();
+    }
+    Ok(())
+}
+
+/// Register a subscriber for one or more fields (private).
+///
+/// Validates that every field exists in the schema, then pushes a
+/// single [`Subscriber`] covering all watched fields. Called from
+/// [`watch()`]'s first poll.
+fn subscribe(store: StoreId, fields: &'static [&'static str], waker: Waker) -> Result<(), StoreError> {
     let mut reg = registry().lock();
-    reg.stores
-        .remove(&store.0)
-        .map(|_| ())
-        .ok_or(StoreError::NotFound)
+    let instance = reg.stores.get_mut(&store.0).ok_or(StoreError::NotFound)?;
+
+    for &field in fields {
+        if !instance.fields.iter().any(|f| f.name == field) {
+            return Err(StoreError::UnknownField);
+        }
+    }
+
+    instance.subscribers.push(Subscriber { fields, waker });
+    Ok(())
+}
+
+/// Watch one or more store fields for changes.
+///
+/// Returns a one-shot future that resolves the next time [`set()`]
+/// writes to any of the watched fields. Use in a loop for persistent
+/// watching:
+///
+/// ```
+/// loop {
+///     store::watch(id, &["uptime_s", "free_kb"]).await?;
+///     let uptime = store::get(id, "uptime_s")?;
+///     let free = store::get(id, "free_kb")?;
+///     // react to new values
+/// }
+/// ```
+///
+/// If the store is destroyed while watching, the future resolves with
+/// [`StoreError::NotFound`].
+pub fn watch(
+    store: StoreId,
+    fields: &'static [&'static str],
+) -> impl Future<Output = Result<(), StoreError>> + Send {
+    let mut subscribed = false;
+
+    core::future::poll_fn(move |cx| {
+        if !subscribed {
+            // First poll: register wakers for all fields and return Pending.
+            Arch::disable_interrupts();
+            match subscribe(store, fields, cx.waker().clone()) {
+                Ok(()) => {
+                    subscribed = true;
+                    Arch::enable_interrupts();
+                    return core::task::Poll::Pending;
+                }
+                Err(e) => {
+                    Arch::enable_interrupts();
+                    return core::task::Poll::Ready(Err(e));
+                }
+            }
+        }
+
+        // Woken by set() or destroy(). Check the store still exists
+        // so watchers can detect destruction.
+        Arch::disable_interrupts();
+        let exists = registry().lock().stores.contains_key(&store.0);
+        Arch::enable_interrupts();
+
+        if exists {
+            core::task::Poll::Ready(Ok(()))
+        } else {
+            core::task::Poll::Ready(Err(StoreError::NotFound))
+        }
+    })
 }

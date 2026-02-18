@@ -27,6 +27,7 @@ pub fn run_all() {
     test_speaker();
     test_store_basic();
     test_store_validation();
+    test_store_subscribe();
     println!();
     println!("[ok] All smoke tests passed");
 }
@@ -562,10 +563,12 @@ fn test_store_basic() {
     assert_eq!(store::get(id, "label").unwrap(), Value::Str(String::from("hello")));
     assert_eq!(store::get(id, "active").unwrap(), Value::Bool(true));
 
-    // Write new values.
-    store::set(id, "count", Value::U32(42)).expect("set count");
-    store::set(id, "label", Value::Str(String::from("world"))).expect("set label");
-    store::set(id, "active", Value::Bool(false)).expect("set active");
+    // Write new values atomically.
+    store::set(id, &[
+        ("count", Value::U32(42)),
+        ("label", Value::Str(String::from("world"))),
+        ("active", Value::Bool(false)),
+    ]).expect("set fields");
 
     // Read them back.
     assert_eq!(store::get(id, "count").unwrap(), Value::U32(42));
@@ -575,7 +578,7 @@ fn test_store_basic() {
     // Destroy and verify NotFound.
     store::destroy(id).expect("destroy");
     assert!(store::get(id, "count").is_err());
-    assert!(store::set(id, "count", Value::U32(1)).is_err());
+    assert!(store::set(id, &[("count", Value::U32(1))]).is_err());
     assert!(store::destroy(id).is_err());
 
     println!("[ok] Store basic operations verified (create, get, set, destroy)");
@@ -613,29 +616,94 @@ fn test_store_validation() {
     }
 
     // Unknown field on set.
-    match store::set(id, "nonexistent", Value::U32(1)) {
+    match store::set(id, &[("nonexistent", Value::U32(1))]) {
         Err(_) => {}
         Ok(_) => panic!("expected UnknownField error on set"),
     }
 
     // Type mismatch: write U32 to a Bool field.
-    match store::set(id, "flag", Value::U32(1)) {
+    match store::set(id, &[("flag", Value::U32(1))]) {
         Err(_) => {}
         Ok(_) => panic!("expected TypeMismatch error"),
     }
 
     // Type mismatch: write Bool to a U32 field.
-    match store::set(id, "score", Value::Bool(true)) {
+    match store::set(id, &[("score", Value::Bool(true))]) {
         Err(_) => {}
         Ok(_) => panic!("expected TypeMismatch error"),
     }
 
+    // All-or-nothing: if one field in a batch fails, nothing is written.
+    let old_flag = store::get(id, "flag").unwrap();
+    match store::set(id, &[("flag", Value::Bool(true)), ("score", Value::Bool(false))]) {
+        Err(_) => {}
+        Ok(_) => panic!("expected TypeMismatch error on batch"),
+    }
+    assert_eq!(store::get(id, "flag").unwrap(), old_flag, "flag should be unchanged after failed batch");
+
     // Valid operations still work after errors.
-    store::set(id, "flag", Value::Bool(true)).expect("valid set after error");
+    store::set(id, &[("flag", Value::Bool(true))]).expect("valid set after error");
     assert_eq!(store::get(id, "flag").unwrap(), Value::Bool(true));
-    store::set(id, "score", Value::U32(200)).expect("valid set after error");
+    store::set(id, &[("score", Value::U32(200))]).expect("valid set after error");
     assert_eq!(store::get(id, "score").unwrap(), Value::U32(200));
 
     store::destroy(id).expect("cleanup");
     println!("[ok] Store schema validation verified (unknown field, type mismatch)");
+}
+
+/// Verify store subscriptions: watch() → set() → waker fires → value received.
+///
+/// Deterministic, no timer or IRQ dependency. Creates a 1-field store,
+/// spawns a future that watches the field, manually drives it through
+/// subscribe → wake → read via poll_once() and set().
+fn test_store_subscribe() {
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+    struct WatchSchema;
+    impl StoreSchema for WatchSchema {
+        fn name() -> &'static str { "Watch" }
+        fn fields() -> &'static [FieldDef] {
+            &[FieldDef { name: "counter", kind: FieldKind::U32 }]
+        }
+    }
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static RECEIVED: AtomicU32 = AtomicU32::new(0);
+    DONE.store(false, Ordering::SeqCst);
+    RECEIVED.store(0, Ordering::SeqCst);
+
+    let id = store::create::<WatchSchema>(&[
+        ("counter", Value::U32(0)),
+    ]).expect("create watch store");
+
+    // Spawn a future that watches the counter field.
+    executor::spawn(async move {
+        if store::watch(id, &["counter"]).await.is_err() {
+            panic!("watch failed");
+        }
+        match store::get(id, "counter") {
+            Ok(Value::U32(v)) => {
+                RECEIVED.store(v, Ordering::SeqCst);
+                DONE.store(true, Ordering::SeqCst);
+            }
+            other => panic!("unexpected get result: {:?}", other),
+        }
+    });
+
+    // First poll: the future calls subscribe(), returns Pending.
+    executor::poll_once();
+    assert!(!DONE.load(Ordering::SeqCst), "future should be pending after first poll");
+
+    // Write a new value — this wakes the subscriber.
+    store::set(id, &[("counter", Value::U32(42))]).expect("set counter");
+
+    // Second poll: the future reads the new value and completes.
+    let completed = executor::poll_once();
+    assert!(DONE.load(Ordering::SeqCst), "future should be done after second poll");
+    assert_eq!(RECEIVED.load(Ordering::SeqCst), 42);
+    assert_eq!(completed, 1);
+
+    store::destroy(id).expect("cleanup watch store");
+    println!("[ok] Store subscription verified (watch wakes on set)");
 }

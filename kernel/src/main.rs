@@ -23,7 +23,9 @@ mod timer;
 mod tests;
 
 use framebuffer::FramebufferInfo;
+use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
 use platform::{Key, Platform};
+use store::StoreId;
 
 // Limine boot protocol requests.
 //
@@ -72,6 +74,42 @@ macro_rules! println {
         $crate::print!("\n");
     }};
 }
+
+// ---------------------------------------------------------------------------
+// Store schemas
+// ---------------------------------------------------------------------------
+
+/// System monitor schema — uptime and free memory.
+struct SystemMonitorSchema;
+
+impl StoreSchema for SystemMonitorSchema {
+    fn name() -> &'static str { "SystemMonitor" }
+    fn fields() -> &'static [FieldDef] {
+        &[
+            FieldDef { name: "uptime_s", kind: FieldKind::U64 },
+            FieldDef { name: "free_kb", kind: FieldKind::U64 },
+        ]
+    }
+}
+
+/// App schema — holds the current background color, driven by keyboard input.
+struct AppSchema;
+
+impl StoreSchema for AppSchema {
+    fn name() -> &'static str { "App" }
+    fn fields() -> &'static [FieldDef] {
+        &[
+            FieldDef { name: "bg_color", kind: FieldKind::U32 },
+        ]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Status bar — footer-style strip at the bottom of the screen.
+// 8px top padding + 16px text + 8px bottom padding = 32px total.
+// ---------------------------------------------------------------------------
+
+const STATUS_BAR_HEIGHT: usize = 32;
 
 /// Kernel entry point — where the bootloader jumps to.
 #[unsafe(no_mangle)]
@@ -128,15 +166,31 @@ extern "C" fn kmain() -> ! {
             });
 
             let fbi = framebuffer::FRAMEBUFFER_INFO.get().unwrap();
-            draw_splash(fbi, framebuffer::Color::DARK_BLUE, None);
+            draw_splash(fbi, framebuffer::Color::DARK_BLUE);
             println!("[ok] Press Enter to randomize colors!");
             println!("[ok] Press F to trigger a divide-by-zero fault.");
             println!("[ok] Press T to show uptime.");
 
+            // Create the system monitor store — updated every second, watched
+            // by the renderer to draw the status bar.
+            let sysmon_id = store::create::<SystemMonitorSchema>(&[
+                ("uptime_s", Value::U64(0)),
+                ("free_kb", Value::U64(0)),
+            ]).expect("create sysmon store");
+
+            // Create the app store — keyboard writes bg_color, display task
+            // watches it and repaints.
+            let app_id = store::create::<AppSchema>(&[
+                ("bg_color", Value::U32(framebuffer::Color::DARK_BLUE.0)),
+            ]).expect("create app store");
+
             // Spawn async tasks, enable interrupts, and hand control to
             // the executor. The keyboard task is IRQ-driven via scancodes;
             // the blink task is PIT-driven via timer::sleep().
-            executor::spawn(keyboard_task());
+            executor::spawn(sysmon_updater(sysmon_id));
+            executor::spawn(sysmon_renderer(sysmon_id, app_id));
+            executor::spawn(keyboard_task(app_id));
+            executor::spawn(display_task(app_id));
             executor::spawn(blink_task());
             executor::spawn(boot_chime());
             arch::Arch::enable_interrupts();
@@ -151,23 +205,78 @@ extern "C" fn kmain() -> ! {
     }
 }
 
-/// Async keyboard task — loops forever reading keys via the IRQ-driven
-/// [`arch::keyboard::next_key()`] future and handling them the
-/// same way the old polling loop did.
-async fn keyboard_task() {
-    let fb = framebuffer::FRAMEBUFFER_INFO
-        .get()
-        .expect("framebuffer not initialized");
+// ---------------------------------------------------------------------------
+// System monitor tasks
+// ---------------------------------------------------------------------------
 
+/// Async task that updates the system monitor store every second.
+///
+/// Reads uptime and free memory from the hardware/allocator and writes
+/// both fields atomically. The renderer watches both fields, so it
+/// wakes once per update cycle.
+async fn sysmon_updater(store: StoreId) {
+    loop {
+        timer::sleep(1000).await;
+
+        let uptime_s = arch::Arch::elapsed_ms() / 1000;
+        // Each frame is 4 KiB, so free_frames * 4 = free KiB.
+        let free_kb = (memory::free_frame_count() as u64) * 4;
+
+        let _ = store::set(store, &[
+            ("uptime_s", Value::U64(uptime_s)),
+            ("free_kb", Value::U64(free_kb)),
+        ]);
+    }
+}
+
+/// Async task that watches the system monitor store and draws the status bar.
+///
+/// Watches both `uptime_s` and `free_kb` — wakes when either changes.
+/// Since the updater writes both atomically, this fires once per cycle.
+/// Reads `bg_color` from the app store to tint the bar background.
+async fn sysmon_renderer(sysmon: StoreId, app: StoreId) {
+    loop {
+        if store::watch(sysmon, &["uptime_s", "free_kb"]).await.is_err() {
+            return;
+        }
+
+        let uptime_s = match store::get(sysmon, "uptime_s") {
+            Ok(Value::U64(v)) => v,
+            _ => return,
+        };
+        let free_kb = match store::get(sysmon, "free_kb") {
+            Ok(Value::U64(v)) => v,
+            _ => return,
+        };
+        let bg = match store::get(app, "bg_color") {
+            Ok(Value::U32(v)) => framebuffer::Color(v),
+            _ => framebuffer::Color::DARK_BLUE,
+        };
+
+        let fb = framebuffer::FRAMEBUFFER_INFO.get().unwrap();
+        draw_status_bar(fb, bg, uptime_s, free_kb);
+        println!("[sysmon] render: {}s, {} KiB free", uptime_s, free_kb);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interactive demo tasks
+// ---------------------------------------------------------------------------
+
+/// Async keyboard task — reads keys and writes state changes to the app store.
+///
+/// Enter randomizes the background color by writing to the store (the
+/// [`display_task`] watches the store and repaints). F and T are direct
+/// actions that don't go through the store.
+async fn keyboard_task(app_store: StoreId) {
     loop {
         let key = arch::keyboard::next_key().await;
         match key {
             Key::Enter => {
                 let rand = arch::Arch::entropy();
-                let bg = framebuffer::Color((rand as u32) & 0x00FFFFFF);
-                let ms = arch::Arch::elapsed_ms();
-                draw_splash(fb, bg, Some(ms));
-                println!("[ok] Color: #{:06X}", bg.0);
+                let bg = (rand as u32) & 0x00FFFFFF;
+                let _ = store::set(app_store, &[("bg_color", Value::U32(bg))]);
+                println!("[ok] Color: #{:06X}", bg);
             }
             Key::F => {
                 println!("[!!] Triggering test fault...");
@@ -180,6 +289,25 @@ async fn keyboard_task() {
             }
             _ => {}
         }
+    }
+}
+
+/// Async display task — watches the app store's `bg_color` and repaints
+/// the splash screen when it changes.
+async fn display_task(app_store: StoreId) {
+    loop {
+        if store::watch(app_store, &["bg_color"]).await.is_err() {
+            return;
+        }
+
+        let color_val = match store::get(app_store, "bg_color") {
+            Ok(Value::U32(v)) => v,
+            _ => return,
+        };
+
+        let fb = framebuffer::FRAMEBUFFER_INFO.get().unwrap();
+        let bg = framebuffer::Color(color_val);
+        draw_splash(fb, bg);
     }
 }
 
@@ -256,10 +384,16 @@ async fn blink_task() {
     }
 }
 
-// Paint the splash screen: solid background with centered title text.
-// If `uptime_ms` is provided, draw the uptime below the hint line.
-fn draw_splash(fb: &FramebufferInfo, bg: framebuffer::Color, uptime_ms: Option<u64>) {
-    framebuffer::clear(fb.ptr, fb.width, fb.height, fb.pitch, bg);
+// ---------------------------------------------------------------------------
+// Drawing helpers
+// ---------------------------------------------------------------------------
+
+/// Paint the splash screen: solid background with centered title text.
+///
+/// Clears only the area above the status bar so the bottom strip is preserved.
+fn draw_splash(fb: &FramebufferInfo, bg: framebuffer::Color) {
+    let splash_height = fb.height.saturating_sub(STATUS_BAR_HEIGHT);
+    framebuffer::clear_rect(fb.ptr, fb.pitch, 0, 0, fb.width, splash_height, bg);
 
     let title = "OBOOS v0.0";
     let subtitle = "Off By One Operating System";
@@ -272,61 +406,69 @@ fn draw_splash(fb: &FramebufferInfo, bg: framebuffer::Color, uptime_ms: Option<u
     framebuffer::draw_str(fb.ptr, fb.pitch, title_x, center_y, title, framebuffer::Color::WHITE);
     framebuffer::draw_str(fb.ptr, fb.pitch, subtitle_x, center_y + 16, subtitle, framebuffer::Color::LIGHT_GRAY);
     framebuffer::draw_str(fb.ptr, fb.pitch, hint_x, center_y + 40, hint, framebuffer::Color::LIGHT_GRAY);
-
-    if let Some(ms) = uptime_ms {
-        let mut buf = [0u8; 32];
-        let uptime_str = fmt_uptime(ms, &mut buf);
-        let uptime_x = (fb.width - uptime_str.len() * 8) / 2;
-        framebuffer::draw_str(fb.ptr, fb.pitch, uptime_x, center_y + 64, uptime_str, framebuffer::Color::WHITE);
-    }
 }
 
-/// Format milliseconds as "Uptime: X.XXX s" into a stack buffer.
-/// Returns the written slice as a `&str`. We do this by hand because
-/// `format!` requires an allocator we don't have yet.
-fn fmt_uptime(ms: u64, buf: &mut [u8; 32]) -> &str {
+/// Draw the status bar at the bottom of the screen.
+///
+/// Layout: darkened background strip, left-aligned text showing uptime
+/// and free memory. The bar occupies the bottom [`STATUS_BAR_HEIGHT`]
+/// pixels and uses a darkened version of the current background color
+/// so it visually recedes behind the main content.
+fn draw_status_bar(fb: &FramebufferInfo, bg: framebuffer::Color, uptime_s: u64, free_kb: u64) {
+    let bar_bg = bg.darken();
+    let bar_y = fb.height - STATUS_BAR_HEIGHT;
+    framebuffer::clear_rect(fb.ptr, fb.pitch, 0, bar_y, fb.width, STATUS_BAR_HEIGHT, bar_bg);
+
+    // Format "Uptime: XXs | Free: XXX KiB" into a stack buffer.
+    let mut buf = [0u8; 64];
+    let mut pos = 0;
+
+    // "Uptime: "
     let prefix = b"Uptime: ";
-    buf[..prefix.len()].copy_from_slice(prefix);
-    let mut pos = prefix.len();
+    buf[pos..pos + prefix.len()].copy_from_slice(prefix);
+    pos += prefix.len();
 
-    // Write the whole-seconds part (variable width).
-    let secs = ms / 1000;
-    let frac = (ms % 1000) as u32;
+    pos += write_u64(&mut buf[pos..], uptime_s);
 
-    // Convert seconds to decimal digits.
-    if secs == 0 {
-        buf[pos] = b'0';
-        pos += 1;
-    } else {
-        let mut digits = [0u8; 20];
-        let mut n = secs;
-        let mut len = 0;
-        while n > 0 {
-            digits[len] = b'0' + (n % 10) as u8;
-            n /= 10;
-            len += 1;
-        }
-        for i in (0..len).rev() {
-            buf[pos] = digits[i];
-            pos += 1;
-        }
+    let mid = b"s | Free: ";
+    buf[pos..pos + mid.len()].copy_from_slice(mid);
+    pos += mid.len();
+
+    pos += write_u64(&mut buf[pos..], free_kb);
+
+    let suffix = b" KiB";
+    buf[pos..pos + suffix.len()].copy_from_slice(suffix);
+    pos += suffix.len();
+
+    let text = core::str::from_utf8(&buf[..pos]).unwrap();
+    let text_y = bar_y + 12; // vertically centered: (32 - 8) / 2 = 12
+    framebuffer::draw_str(fb.ptr, fb.pitch, 16, text_y, text, framebuffer::Color::LIGHT_GRAY);
+}
+
+/// Write a `u64` as decimal digits into a byte buffer.
+///
+/// Returns the number of bytes written. Used by [`draw_status_bar()`] and
+/// [`fmt_uptime()`] to format numbers without `format!` (which needs an
+/// allocator we want to avoid on the drawing path).
+fn write_u64(buf: &mut [u8], val: u64) -> usize {
+    if val == 0 {
+        buf[0] = b'0';
+        return 1;
     }
 
-    // Write ".XXX s"
-    buf[pos] = b'.';
-    pos += 1;
-    buf[pos] = b'0' + (frac / 100) as u8;
-    pos += 1;
-    buf[pos] = b'0' + ((frac / 10) % 10) as u8;
-    pos += 1;
-    buf[pos] = b'0' + (frac % 10) as u8;
-    pos += 1;
-    buf[pos] = b' ';
-    pos += 1;
-    buf[pos] = b's';
-    pos += 1;
+    let mut digits = [0u8; 20];
+    let mut n = val;
+    let mut len = 0;
+    while n > 0 {
+        digits[len] = b'0' + (n % 10) as u8;
+        n /= 10;
+        len += 1;
+    }
 
-    core::str::from_utf8(&buf[..pos]).unwrap()
+    for i in (0..len).rev() {
+        buf[len - 1 - i] = digits[i];
+    }
+    len
 }
 
 /// Panic handler — required by `#![no_std]`.

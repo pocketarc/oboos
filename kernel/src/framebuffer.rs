@@ -53,6 +53,14 @@ impl Color {
     pub const DARK_BLUE: Color = Color(0x001A1A2E);
     /// Muted gray — used for secondary text.
     pub const LIGHT_GRAY: Color = Color(0x00AAAAAA);
+
+    /// Return a darker version of this color by halving each RGB channel.
+    pub fn darken(self) -> Color {
+        let r = (self.0 >> 16) & 0xFF;
+        let g = (self.0 >> 8) & 0xFF;
+        let b = self.0 & 0xFF;
+        Color((r >> 1) << 16 | (g >> 1) << 8 | (b >> 1))
+    }
 }
 
 // Draw a single character at pixel position (x, y).
@@ -122,11 +130,28 @@ pub fn draw_str(fb_ptr: *mut u8, pitch: usize, x: usize, y: usize, s: &str, colo
 
 /// Fill the entire framebuffer with a solid color.
 pub fn clear(fb_ptr: *mut u8, width: usize, height: usize, pitch: usize, color: Color) {
+    clear_rect(fb_ptr, pitch, 0, 0, width, height, color);
+}
+
+/// Fill a rectangular region with a solid color.
+///
+/// Like [`clear()`] but bounded to the rectangle at `(x, y)` with
+/// dimensions `w × h`. Used to repaint areas (like the splash screen)
+/// without wiping the entire framebuffer (like the status bar).
+pub fn clear_rect(
+    fb_ptr: *mut u8,
+    pitch: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: Color,
+) {
     let (r, g, b) = ((color.0 >> 16) as u8, (color.0 >> 8) as u8, color.0 as u8);
 
-    for y in 0..height {
-        for x in 0..width {
-            let offset = y * pitch + x * 4;
+    for row in y..y + h {
+        for col in x..x + w {
+            let offset = row * pitch + col * 4;
             unsafe {
                 *fb_ptr.add(offset) = b;
                 *fb_ptr.add(offset + 1) = g;
