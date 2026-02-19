@@ -20,17 +20,20 @@
 //!
 //! ## Syscall interface
 //!
-//! Three syscalls express all kernel interaction through the store:
+//! Five syscalls express all kernel interaction through the store:
 //!
 //! | # | Name            | Args                                               | Returns            |
 //! |---|-----------------|----------------------------------------------------|--------------------|
 //! | 0 | SYS_STORE_GET   | store_id, fields_ptr, fields_len, out_ptr, out_len | bytes written      |
 //! | 1 | SYS_STORE_SET   | store_id, buf_ptr, buf_len, 0, 0                   | 0 on success       |
-//! | 2 | SYS_STORE_WATCH | store_id, field_ptr, field_len, 0, 0               | 0 on success       |
+//! | 2 | SYS_SUBSCRIBE   | store_id, field_ptr, field_len, 0, 0               | sub_id (0-63)      |
+//! | 3 | SYS_UNSUBSCRIBE | sub_id, 0, 0, 0, 0                                | 0 on success       |
+//! | 4 | SYS_YIELD       | 0, 0, 0, 0, 0                                     | fired bitmask      |
 //!
 //! GET and SET use packed buffers for multi-field operations. Each field
-//! name or value is prefixed with a `u16` length. Errors return structured
-//! codes from [`oboos_api::error`] instead of a flat `u64::MAX`.
+//! name or value is prefixed with a `u16` length. SUBSCRIBE registers a
+//! persistent watcher; YIELD sleeps until a subscription fires. Errors
+//! return structured codes from [`oboos_api::error`].
 //!
 //! ## Well-known store IDs
 //!
@@ -79,7 +82,7 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{RawWaker, RawWakerVTable, Waker};
 
 use crate::platform::{Platform, SerialConsole};
@@ -105,7 +108,9 @@ const EFER_SCE: u64 = 1 << 0;
 
 const SYS_STORE_GET: u64 = 0;
 const SYS_STORE_SET: u64 = 1;
-const SYS_STORE_WATCH: u64 = 2;
+const SYS_SUBSCRIBE: u64 = 2;
+const SYS_UNSUBSCRIBE: u64 = 3;
+const SYS_YIELD: u64 = 4;
 
 // ————————————————————————————————————————————————————————————————————————————
 // Well-known store IDs
@@ -162,7 +167,7 @@ pub fn destroy_console_store(id: StoreId) {
 }
 
 /// Read the current console store ID, if one exists.
-fn console_store_id() -> Option<StoreId> {
+pub(crate) fn console_store_id() -> Option<StoreId> {
     let raw = CONSOLE_STORE_ID.load(Ordering::Relaxed);
     if raw == u64::MAX { None } else { Some(StoreId::from_raw(raw)) }
 }
@@ -439,16 +444,19 @@ unsafe extern "C" fn syscall_entry() {
 /// Called from [`syscall_entry`] with interrupts disabled (FMASK clears IF).
 /// Arguments arrive in System V order after the entry stub's register shuffle.
 ///
-/// Three syscalls — GET, SET, WATCH. Everything (process identity,
-/// console output, console input, process exit) is expressed through
-/// well-known store IDs and side-effects triggered by specific field writes.
+/// Five syscalls: GET, SET, SUBSCRIBE, UNSUBSCRIBE, YIELD. Everything
+/// (process identity, console output, console input, process exit) is
+/// expressed through well-known store IDs and side-effects triggered by
+/// specific field writes.
 extern "C" fn syscall_handler(
     number: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
 ) -> u64 {
     match number {
         SYS_STORE_GET => handle_store_get(arg1, arg2, arg3, arg4, arg5),
         SYS_STORE_SET => handle_store_set(arg1, arg2, arg3, arg4, arg5),
-        SYS_STORE_WATCH => handle_store_watch(arg1, arg2, arg3),
+        SYS_SUBSCRIBE => handle_subscribe(arg1, arg2, arg3),
+        SYS_UNSUBSCRIBE => handle_unsubscribe(arg1),
+        SYS_YIELD => handle_yield(),
         _ => {
             crate::println!("[syscall] unknown: {}", number);
             oboos_api::ERR_INVALID_ARG
@@ -462,11 +470,7 @@ extern "C" fn syscall_handler(
 
 /// Map a [`StoreError`] to the corresponding structured error code.
 fn map_store_error(e: &StoreError) -> u64 {
-    match e {
-        StoreError::NotFound => oboos_api::ERR_NOT_FOUND,
-        StoreError::UnknownField => oboos_api::ERR_UNKNOWN_FIELD,
-        StoreError::TypeMismatch => oboos_api::ERR_TYPE_MISMATCH,
-    }
+    e.to_raw()
 }
 
 // ————————————————————————————————————————————————————————————————————————————
@@ -799,39 +803,50 @@ fn handle_store_set(
 }
 
 // ————————————————————————————————————————————————————————————————————————————
-// SYS_STORE_WATCH — blocking single-field watch
+// Subscription tracking (SYS_SUBSCRIBE / SYS_UNSUBSCRIBE / SYS_YIELD)
 // ————————————————————————————————————————————————————————————————————————————
 
-/// Global flag set by the watch waker when the watched field is written.
-/// Since only one process runs at a time, a single flag suffices.
-static WATCH_FLAG: AtomicBool = AtomicBool::new(false);
+/// Tracks which store each subscription slot belongs to.
+struct SubscriptionSlot {
+    store: StoreId,
+}
 
-/// Custom [`RawWakerVTable`] for the watch flag waker. `wake()` sets
-/// [`WATCH_FLAG`] to true. Zero allocation, stable address.
-static WATCH_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    |data| RawWaker::new(data, &WATCH_WAKER_VTABLE), // clone
-    |_| WATCH_FLAG.store(true, Ordering::SeqCst),     // wake
-    |_| WATCH_FLAG.store(true, Ordering::SeqCst),     // wake_by_ref
-    |_| {},                                            // drop
+/// 64 subscription slots, one per bit in [`FIRED_MASK`].
+static SUBSCRIPTIONS: spin::Mutex<[Option<SubscriptionSlot>; 64]> =
+    spin::Mutex::new([const { None }; 64]);
+
+/// Bitmask of fired subscriptions. Bit N is set when subscription N's
+/// watcher fires. [`handle_yield`] atomically swaps this to 0 and
+/// returns the old value to userspace.
+static FIRED_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// Custom waker vtable for subscription slots. `wake()` sets bit
+/// `sub_id` in [`FIRED_MASK`] via `fetch_or`. Same zero-alloc pattern
+/// as the executor's wakers — the sub_id is packed into the data pointer.
+static SUB_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    |data| RawWaker::new(data, &SUB_WAKER_VTABLE), // clone
+    |data| {
+        let sub_id = data as u64;
+        FIRED_MASK.fetch_or(1 << sub_id, Ordering::SeqCst);
+    }, // wake
+    |data| {
+        let sub_id = data as u64;
+        FIRED_MASK.fetch_or(1 << sub_id, Ordering::SeqCst);
+    }, // wake_by_ref
+    |_| {}, // drop
 );
 
-/// Create a [`Waker`] that sets [`WATCH_FLAG`] on wake.
-fn watch_flag_waker() -> Waker {
-    let raw = RawWaker::new(core::ptr::null(), &WATCH_WAKER_VTABLE);
+/// Create a [`Waker`] that sets bit `sub_id` in [`FIRED_MASK`] on wake.
+fn subscription_waker(sub_id: u64) -> Waker {
+    let raw = RawWaker::new(sub_id as *const (), &SUB_WAKER_VTABLE);
     unsafe { Waker::from_raw(raw) }
 }
 
-/// Handle SYS_STORE_WATCH (syscall 2).
+/// Handle SYS_SUBSCRIBE (syscall 2).
 ///
-/// Blocks until the specified field is written (via `set` or `push`).
-/// Uses a busy-wait loop that calls [`poll_once()`] to keep async tasks
-/// running (e.g. the console driver) while waiting for the waker to fire.
-///
-/// For console `"input"` watches, also polls the keyboard buffer each
-/// iteration and pushes ASCII bytes into the console store.
-///
-/// Returns 0 on success, or a structured error code on failure.
-fn handle_store_watch(store_id_raw: u64, field_ptr: u64, field_len: u64) -> u64 {
+/// Registers a persistent watcher on a store field. Returns the
+/// subscription ID (0-63) on success, or an error code on failure.
+fn handle_subscribe(store_id_raw: u64, field_ptr: u64, field_len: u64) -> u64 {
     if !validate_user_ptr(field_ptr, field_len) {
         return oboos_api::ERR_INVALID_ARG;
     }
@@ -849,63 +864,93 @@ fn handle_store_watch(store_id_raw: u64, field_ptr: u64, field_len: u64) -> u64 
         None => return oboos_api::ERR_NOT_FOUND,
     };
 
-    // Verify the field exists before subscribing.
-    if let Err(e) = store::field_kind_no_cli(id, field_name) {
-        return map_store_error(&e);
-    }
-
-    // Detect whether we're watching console input — if so, we'll poll
-    // the keyboard buffer each iteration of the wait loop.
-    let watching_console_input = {
-        let console_id = console_store_id();
-        console_id == Some(id) && field_name == "input"
+    // Allocate a free subscription slot.
+    let mut subs = SUBSCRIPTIONS.lock();
+    let sub_id = match subs.iter().position(|s| s.is_none()) {
+        Some(i) => i as u64,
+        None => return oboos_api::ERR_WOULD_BLOCK,
     };
 
-    WATCH_FLAG.store(false, Ordering::SeqCst);
+    let waker = subscription_waker(sub_id);
+    match store::add_watcher_no_cli(id, field_name, waker, sub_id) {
+        Ok(fire_immediately) => {
+            subs[sub_id as usize] = Some(SubscriptionSlot { store: id });
+            if fire_immediately {
+                FIRED_MASK.fetch_or(1 << sub_id, Ordering::SeqCst);
+            }
+            sub_id
+        }
+        Err(e) => map_store_error(&e),
+    }
+}
 
-    // Subscribe with a flag-based waker.
-    let waker = watch_flag_waker();
-    if let Err(e) = store::subscribe_no_cli(id, field_name, waker) {
-        return map_store_error(&e);
+/// Handle SYS_UNSUBSCRIBE (syscall 3).
+///
+/// Removes a subscription by its ID. Returns 0 on success, or an
+/// error code if the slot was already empty.
+fn handle_unsubscribe(sub_id: u64) -> u64 {
+    if sub_id >= 64 {
+        return oboos_api::ERR_INVALID_ARG;
     }
 
-    // Busy-wait loop. Preemption is disabled so PIT ticks don't switch
-    // us to stale scheduler tasks, but poll_once() briefly enables
-    // interrupts to process async tasks.
+    let mut subs = SUBSCRIPTIONS.lock();
+    let slot = match subs[sub_id as usize].take() {
+        Some(s) => s,
+        None => return oboos_api::ERR_NOT_FOUND,
+    };
+    drop(subs);
+
+    let _ = store::remove_watcher_no_cli(slot.store, sub_id);
+    FIRED_MASK.fetch_and(!(1 << sub_id), Ordering::SeqCst);
+    0
+}
+
+/// Handle SYS_YIELD (syscall 4).
+///
+/// Sleeps until at least one subscription fires, then returns the
+/// bitmask of fired subscription IDs. Drives async tasks via
+/// [`poll_once()`] while waiting. Preemption is suppressed so PIT
+/// ticks don't context-switch us off the syscall kernel stack.
+fn handle_yield() -> u64 {
     crate::scheduler::disable_preemption();
-
     loop {
-        // Process async tasks (console driver, etc.).
-        crate::executor::poll_once();
-
-        // If watching console input, drain scancodes from the keyboard
-        // buffer and push them as ASCII bytes into the console store.
-        if watching_console_input {
+        let mask = FIRED_MASK.swap(0, Ordering::SeqCst);
+        if mask != 0 {
+            crate::scheduler::enable_preemption();
             crate::arch::Arch::disable_interrupts();
-            while let Some(scancode) = super::keyboard::pop_scancode() {
-                if scancode & 0x80 != 0 { continue; } // skip break codes
-                if let Some(ascii) = super::keyboard::scancode_to_ascii(scancode) {
-                    let _ = store::push_no_cli(id, "input", Value::U8(ascii));
-                }
-            }
-            crate::arch::Arch::enable_interrupts();
+            return mask;
         }
-
-        if WATCH_FLAG.load(Ordering::SeqCst) { break; }
-
-        crate::arch::Arch::enable_interrupts();
+        crate::executor::poll_once();
         crate::arch::Arch::halt_until_interrupt();
     }
+}
 
-    crate::scheduler::enable_preemption();
+/// Clear all subscriptions. Called on process exit to prevent stale
+/// watchers from firing after the process is gone.
+pub fn clear_all_subscriptions() {
+    let mut subs = SUBSCRIPTIONS.lock();
+    for i in 0..64 {
+        if let Some(slot) = subs[i].take() {
+            let _ = store::remove_watcher_no_cli(slot.store, i as u64);
+        }
+    }
+    FIRED_MASK.store(0, Ordering::SeqCst);
+}
 
-    // Restore IF=0 for the sysretq path.
-    crate::arch::Arch::disable_interrupts();
-
-    // Check the store still exists (it may have been destroyed while waiting).
-    match store::field_kind_no_cli(id, field_name) {
-        Ok(_) => 0,
-        Err(_) => oboos_api::ERR_NOT_FOUND,
+/// Async keyboard input driver — reads scancodes from the keyboard
+/// buffer, translates them to ASCII, and pushes them into the console
+/// store's `"input"` queue.
+///
+/// Each push fires persistent watchers → sets FIRED_MASK bits →
+/// SYS_YIELD returns to userspace.
+pub async fn keyboard_input_driver() {
+    let id = match console_store_id() {
+        Some(id) => id,
+        None => return,
+    };
+    loop {
+        let byte = super::keyboard::next_console_byte().await;
+        let _ = store::push(id, "input", Value::U8(byte));
     }
 }
 

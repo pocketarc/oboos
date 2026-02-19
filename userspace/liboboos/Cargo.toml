@@ -2,3 +2,6 @@
 name = "liboboos"
 version = "0.0.1"
 edition = "2024"
+
+[dependencies]
+oboos-api = { path = "../../api", default-features = false }

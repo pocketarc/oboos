@@ -1,29 +1,42 @@
 //! OBOOS userspace runtime library.
 //!
-//! Provides the syscall ABI, high-level wrappers, and a panic handler for
-//! all Ring 3 programs. Any code that a second userspace binary would need
-//! to copy-paste belongs here instead of in the application.
+//! Provides the syscall ABI, high-level wrappers, an async executor, and a
+//! panic handler for all Ring 3 programs. Any code that a second userspace
+//! binary would need to copy-paste belongs here instead of in the application.
 //!
 //! ## Syscall interface
 //!
-//! Three syscalls express all kernel interaction through the store:
+//! Five syscalls express all kernel interaction through the store:
 //!
 //! | # | Name            | Args                                               | Returns            |
 //! |---|-----------------|----------------------------------------------------|--------------------|
 //! | 0 | SYS_STORE_GET   | store_id, fields_ptr, fields_len, out_ptr, out_len | bytes written      |
 //! | 1 | SYS_STORE_SET   | store_id, buf_ptr, buf_len, 0, 0                   | 0 on success       |
-//! | 2 | SYS_STORE_WATCH | store_id, field_ptr, field_len, 0, 0               | 0 on success       |
+//! | 2 | SYS_SUBSCRIBE   | store_id, field_ptr, field_len, 0, 0               | sub_id (0-63)      |
+//! | 3 | SYS_UNSUBSCRIBE | sub_id, 0, 0, 0, 0                                | 0 on success       |
+//! | 4 | SYS_YIELD       | 0, 0, 0, 0, 0                                     | fired bitmask      |
 //!
 //! GET and SET use packed buffers with u16 length prefixes for multi-field
-//! operations. WATCH blocks until a field is written.
+//! operations. All use 5 arguments passed in RDI, RSI, RDX, R10, R8
+//! (Linux convention). SYSCALL clobbers RCX (saves RIP) and R11 (saves RFLAGS).
 //!
-//! All three use 5 arguments passed in RDI, RSI, RDX, R10, R8 (Linux convention).
-//! SYSCALL clobbers RCX (saves RIP) and R11 (saves RFLAGS).
+//! ## Error handling
 //!
-//! ## Error codes
+//! All fallible functions return `Result<T, StoreError>`. The [`StoreError`]
+//! enum is shared with the kernel via the `oboos-api` crate. Raw `u64` error
+//! codes from syscalls are converted via [`StoreError::from_raw`].
 //!
-//! Errors are returned as `u64` values at the top of the address space
-//! (>= `ERR_THRESHOLD`). Use [`is_error()`] to check.
+//! ## Type-generic store access
+//!
+//! [`store_get`] and [`store_set`] use the [`FromStoreBytes`] and
+//! [`IntoStoreBytes`] traits to support multiple value types through a
+//! single generic function. The compiler dispatches at the call site:
+//!
+//! ```
+//! store_set(id, "counter", 42u64)?;
+//! let val: u64 = store_get(id, "counter")?;
+//! let byte: Option<u8> = store_get(CONSOLE, "input")?;
+//! ```
 //!
 //! ## Well-known store IDs
 //!
@@ -33,29 +46,22 @@
 
 #![no_std]
 
+use core::future::Future;
+use core::pin::Pin;
+use core::sync::atomic::{AtomicU64, Ordering};
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+pub use oboos_api::{StoreError, is_error, ERR_THRESHOLD};
+
 // ————————————————————————————————————————————————————————————————————————————
 // Syscall numbers — must match kernel/src/arch/x86_64/syscall.rs
 // ————————————————————————————————————————————————————————————————————————————
 
 pub const SYS_STORE_GET: u64 = 0;
 pub const SYS_STORE_SET: u64 = 1;
-pub const SYS_STORE_WATCH: u64 = 2;
-
-// ————————————————————————————————————————————————————————————————————————————
-// Error codes — must match api/src/error.rs
-// ————————————————————————————————————————————————————————————————————————————
-
-pub const ERR_NOT_FOUND: u64     = u64::MAX;
-pub const ERR_UNKNOWN_FIELD: u64 = u64::MAX - 1;
-pub const ERR_TYPE_MISMATCH: u64 = u64::MAX - 2;
-pub const ERR_INVALID_ARG: u64   = u64::MAX - 3;
-pub const ERR_WOULD_BLOCK: u64   = u64::MAX - 4;
-pub const ERR_THRESHOLD: u64     = u64::MAX - 15;
-
-/// Check whether a syscall return value is an error code.
-pub fn is_error(result: u64) -> bool {
-    result > ERR_THRESHOLD
-}
+pub const SYS_SUBSCRIBE: u64 = 2;
+pub const SYS_UNSUBSCRIBE: u64 = 3;
+pub const SYS_YIELD: u64 = 4;
 
 // ————————————————————————————————————————————————————————————————————————————
 // Well-known store IDs
@@ -74,7 +80,7 @@ pub const CONSOLE: u64 = (1 << 63) | 1;
 // Raw syscall wrapper
 // ————————————————————————————————————————————————————————————————————————————
 
-/// Syscall with 5 arguments — the only raw syscall needed, since all three
+/// Syscall with 5 arguments — the only raw syscall needed, since all
 /// syscalls take exactly 5 args (unused args are 0).
 ///
 /// Register mapping follows the Linux SYSCALL convention:
@@ -148,69 +154,134 @@ fn decode_value<'a>(buf: &'a [u8], off: &mut usize) -> &'a [u8] {
     val
 }
 
+/// Convert a raw syscall return value into a `Result`.
+/// Returns `Ok(val)` if not an error, `Err(StoreError)` otherwise.
+fn check_error(raw: u64) -> Result<u64, StoreError> {
+    if is_error(raw) {
+        Err(StoreError::from_raw(raw).unwrap_or(StoreError::InvalidArg))
+    } else {
+        Ok(raw)
+    }
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// Type-generic store traits
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Types that can be serialized into a store SET buffer.
+pub trait IntoStoreBytes {
+    /// Write this value's bytes into `buf` and return the number of bytes written.
+    fn write_to(&self, buf: &mut [u8]) -> usize;
+}
+
+impl IntoStoreBytes for u64 {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        let bytes = self.to_ne_bytes();
+        buf[..8].copy_from_slice(&bytes);
+        8
+    }
+}
+
+impl IntoStoreBytes for u8 {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        buf[0] = *self;
+        1
+    }
+}
+
+impl IntoStoreBytes for &str {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        let bytes = self.as_bytes();
+        buf[..bytes.len()].copy_from_slice(bytes);
+        bytes.len()
+    }
+}
+
+impl IntoStoreBytes for bool {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        buf[0] = *self as u8;
+        1
+    }
+}
+
+/// Types that can be deserialized from a store GET response.
+pub trait FromStoreBytes: Sized {
+    /// Interpret the raw bytes from a GET response value.
+    /// Returns `None` if the bytes don't match the expected format.
+    fn from_bytes(bytes: &[u8]) -> Option<Self>;
+
+    /// Whether this value represents "no data available" (e.g. an empty
+    /// queue pop). Used by [`WatchFuture`] to decide whether to keep
+    /// the READY_MASK bit set for draining multi-item queues.
+    fn is_empty(&self) -> bool { false }
+}
+
+impl FromStoreBytes for u64 {
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 8 { return None; }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(bytes);
+        Some(u64::from_ne_bytes(arr))
+    }
+}
+
+/// `Option<u8>` represents a Queue(U8) pop: empty queue returns `None`,
+/// otherwise `Some(byte)`.
+impl FromStoreBytes for Option<u8> {
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() {
+            Some(None)
+        } else {
+            Some(Some(bytes[0]))
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.is_none()
+    }
+}
+
 // ————————————————————————————————————————————————————————————————————————————
 // High-level syscall wrappers
 // ————————————————————————————————————————————————————————————————————————————
 
-/// Read a U64 value from a store field via SYS_STORE_GET.
+/// Read a typed value from a store field via SYS_STORE_GET.
 ///
-/// Encodes the field name in packed format, provides an output buffer,
-/// and interprets the result as a native-endian `u64`. Returns 0 on error.
-pub fn store_get(store_id: u64, field: &str) -> u64 {
+/// The return type is inferred from context via [`FromStoreBytes`]:
+///
+/// ```
+/// let counter: u64 = store_get(id, "counter")?;
+/// let byte: Option<u8> = store_get(CONSOLE, "input")?;
+/// ```
+pub fn store_get<T: FromStoreBytes>(store_id: u64, field: &str) -> Result<T, StoreError> {
     let mut fields = [0u8; 64];
     let mut off = 0;
     encode_field(&mut fields, &mut off, field);
 
-    let mut out = [0u8; 16]; // u16 prefix + 8 bytes for u64
+    let mut out = [0u8; 1024];
     let ret = syscall5(
         SYS_STORE_GET,
         store_id,
         fields.as_ptr() as u64, off as u64,
         out.as_mut_ptr() as u64, out.len() as u64,
     );
-    if is_error(ret) || ret < 10 { return 0; }
-
-    // Skip u16 length prefix, read u64.
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(&out[2..10]);
-    u64::from_ne_bytes(arr)
-}
-
-/// Read a U8 value from a store field via SYS_STORE_GET.
-///
-/// For Queue(U8) fields this pops the front element. Returns `None` if
-/// the queue is empty or on error.
-pub fn store_get_u8(store_id: u64, field: &str) -> Option<u8> {
-    let mut fields = [0u8; 64];
-    let mut off = 0;
-    encode_field(&mut fields, &mut off, field);
-
-    let mut out = [0u8; 8]; // u16 prefix + 1 byte for u8
-    let ret = syscall5(
-        SYS_STORE_GET,
-        store_id,
-        fields.as_ptr() as u64, off as u64,
-        out.as_mut_ptr() as u64, out.len() as u64,
-    );
-    if is_error(ret) { return None; }
+    check_error(ret)?;
 
     let mut decode_off = 0;
-    let val = decode_value(&out, &mut decode_off);
-    if val.is_empty() { return None; }
-    Some(val[0])
+    let val = decode_value(&out[..ret as usize], &mut decode_off);
+    T::from_bytes(val).ok_or(StoreError::TypeMismatch)
 }
 
-/// Read a string value from a store field via SYS_STORE_GET.
+/// Read a string value from a store field into a caller-provided buffer.
 ///
-/// Copies the string bytes into the provided buffer and returns the
-/// number of bytes written. Returns 0 on error or if the field is empty.
-pub fn store_get_str(store_id: u64, field: &str, out: &mut [u8]) -> usize {
+/// Returns the number of bytes written. Separate from [`store_get`]
+/// because string GET needs a caller-provided buffer (can't return
+/// owned data without alloc).
+pub fn store_get_str(store_id: u64, field: &str, out: &mut [u8]) -> Result<usize, StoreError> {
     let mut fields = [0u8; 64];
     let mut off = 0;
     encode_field(&mut fields, &mut off, field);
 
-    // We need the u16 prefix + up to out.len() bytes of string data.
-    // Use the caller's buffer with 2 extra bytes for the prefix.
     let total_out_len = out.len() + 2;
     let mut tmp = [0u8; 1024];
     let buf_len = total_out_len.min(tmp.len());
@@ -221,69 +292,51 @@ pub fn store_get_str(store_id: u64, field: &str, out: &mut [u8]) -> usize {
         fields.as_ptr() as u64, off as u64,
         tmp.as_mut_ptr() as u64, buf_len as u64,
     );
-    if is_error(ret) || ret < 2 { return 0; }
+    check_error(ret)?;
+    if ret < 2 { return Ok(0); }
 
     let mut decode_off = 0;
     let val = decode_value(&tmp[..ret as usize], &mut decode_off);
     let copy_len = val.len().min(out.len());
     out[..copy_len].copy_from_slice(&val[..copy_len]);
-    copy_len
+    Ok(copy_len)
 }
 
-/// Write a U64 value to a store field via SYS_STORE_SET.
+/// Write a typed value to a store field via SYS_STORE_SET.
 ///
-/// Encodes the field name + value in packed format.
-pub fn store_set(store_id: u64, field: &str, value: u64) -> u64 {
-    let mut buf = [0u8; 64];
-    let mut off = 0;
-    encode_pair(&mut buf, &mut off, field, &value.to_ne_bytes());
-    syscall5(SYS_STORE_SET, store_id, buf.as_ptr() as u64, off as u64, 0, 0)
-}
-
-/// Write a U8 value to a store field via SYS_STORE_SET.
-pub fn store_set_u8(store_id: u64, field: &str, value: u8) -> u64 {
-    let mut buf = [0u8; 64];
-    let mut off = 0;
-    encode_pair(&mut buf, &mut off, field, &[value]);
-    syscall5(SYS_STORE_SET, store_id, buf.as_ptr() as u64, off as u64, 0, 0)
-}
-
-/// Write a string value to a store field via SYS_STORE_SET.
+/// The value type is inferred from context via [`IntoStoreBytes`]:
 ///
-/// Encodes the field name + string bytes in packed format.
-pub fn store_set_str(store_id: u64, field: &str, value: &str) -> u64 {
-    let mut buf = [0u8; 256];
-    let mut off = 0;
-    encode_pair(&mut buf, &mut off, field, value.as_bytes());
-    syscall5(SYS_STORE_SET, store_id, buf.as_ptr() as u64, off as u64, 0, 0)
-}
+/// ```
+/// store_set(id, "counter", 42u64)?;
+/// store_set(CONSOLE, "output", "hello\n")?;
+/// ```
+pub fn store_set(store_id: u64, field: &str, value: impl IntoStoreBytes) -> Result<(), StoreError> {
+    let mut val_buf = [0u8; 256];
+    let val_len = value.write_to(&mut val_buf);
 
-/// Block until a store field is written.
-///
-/// Returns 0 on success, or an error code if the store doesn't exist
-/// or the field is unknown.
-pub fn store_watch(store_id: u64, field: &str) -> u64 {
-    syscall5(
-        SYS_STORE_WATCH,
-        store_id,
-        field.as_ptr() as u64, field.len() as u64,
-        0, 0,
-    )
+    let mut buf = [0u8; 512];
+    let mut off = 0;
+    encode_pair(&mut buf, &mut off, field, &val_buf[..val_len]);
+
+    let ret = syscall5(SYS_STORE_SET, store_id, buf.as_ptr() as u64, off as u64, 0, 0);
+    check_error(ret)?;
+    Ok(())
 }
 
 /// Write a string to the serial console.
 ///
 /// Pushes a string onto the `"output"` queue on the [`CONSOLE`] store.
 /// The kernel's async console driver drains the queue to serial.
+/// Fire-and-forget — ignores errors for convenience.
 pub fn write(msg: &str) {
-    store_set_str(CONSOLE, "output", msg);
+    let _ = store_set(CONSOLE, "output", msg);
 }
 
 /// Get the current process's PID.
 ///
 /// Reads the `"pid"` field from the [`PROCESS`] well-known store.
 pub fn getpid() -> u64 {
-    store_get(PROCESS, "pid")
+    store_get::<u64>(PROCESS, "pid").unwrap_or(0)
 }
 
 /// Exit the program with an exit code, returning control to the kernel.
@@ -299,6 +352,169 @@ pub fn exit(code: u64) -> ! {
     encode_pair(&mut buf, &mut off, "status", b"exiting");
     syscall5(SYS_STORE_SET, PROCESS, buf.as_ptr() as u64, off as u64, 0, 0);
     loop {}
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// Subscription syscall wrappers
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Subscribe to a store field for persistent notifications.
+///
+/// Returns a subscription ID (0-63) that can be used with [`unsubscribe`]
+/// and appears as a bit in the bitmask returned by [`sys_yield`].
+pub fn subscribe(store_id: u64, field: &str) -> Result<u64, StoreError> {
+    let ret = syscall5(
+        SYS_SUBSCRIBE,
+        store_id,
+        field.as_ptr() as u64, field.len() as u64,
+        0, 0,
+    );
+    check_error(ret)
+}
+
+/// Remove a subscription by its ID.
+pub fn unsubscribe(sub_id: u64) -> Result<(), StoreError> {
+    let ret = syscall5(SYS_UNSUBSCRIBE, sub_id, 0, 0, 0, 0);
+    check_error(ret)?;
+    Ok(())
+}
+
+/// Yield to the kernel until at least one subscription fires.
+///
+/// Returns a bitmask where bit N is set if subscription N fired.
+pub fn sys_yield() -> u64 {
+    syscall5(SYS_YIELD, 0, 0, 0, 0, 0)
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// Userspace async executor
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Bitmask of subscription IDs that have fired. Updated by [`block_on`]
+/// after each [`sys_yield`] call, consumed by [`WatchFuture::poll`].
+static READY_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// No-op waker vtable. We always re-poll after YIELD returns, so wakers
+/// don't need to do anything.
+static NOOP_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    |data| RawWaker::new(data, &NOOP_VTABLE), // clone
+    |_| {},                                     // wake
+    |_| {},                                     // wake_by_ref
+    |_| {},                                     // drop
+);
+
+fn noop_waker() -> Waker {
+    let raw = RawWaker::new(core::ptr::null(), &NOOP_VTABLE);
+    unsafe { Waker::from_raw(raw) }
+}
+
+/// Run a future to completion, yielding to the kernel between polls.
+///
+/// This is the userspace async executor. Each time the future returns
+/// `Pending`, we call [`sys_yield`] to sleep until a subscription fires,
+/// then merge the returned bitmask into [`READY_MASK`] so [`WatchFuture`]s
+/// can check their bits on the next poll.
+pub fn block_on<F: Future>(f: F) -> F::Output {
+    let mut f = core::pin::pin!(f);
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        match f.as_mut().poll(&mut cx) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => {
+                let mask = sys_yield();
+                READY_MASK.fetch_or(mask, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// Watcher — persistent field subscription as an async stream
+// ————————————————————————————————————————————————————————————————————————————
+
+/// A persistent subscription to a store field.
+///
+/// Created by [`watch`]. Each call to [`next`](Watcher::next) returns a
+/// future that resolves when the subscription fires and a GET succeeds.
+/// Dropping the `Watcher` automatically unsubscribes.
+pub struct Watcher {
+    sub_id: u64,
+    store_id: u64,
+    field: &'static str,
+}
+
+impl Watcher {
+    /// Await the next value from the watched field.
+    ///
+    /// Returns `Some(value)` when a new value is available, or `None`
+    /// for spurious wakes (e.g. queue was empty). The return type is
+    /// inferred from context via [`FromStoreBytes`].
+    pub fn next<T: FromStoreBytes>(&mut self) -> WatchFuture<'_, T> {
+        WatchFuture {
+            watcher: self,
+            _marker: core::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        let _ = unsubscribe(self.sub_id);
+    }
+}
+
+/// Future returned by [`Watcher::next`].
+///
+/// Checks [`READY_MASK`] for the subscription's bit. When set, clears it
+/// and calls [`store_get`] to retrieve the value. If the GET succeeds,
+/// re-sets the bit so the next [`Watcher::next`] call also tries a GET
+/// immediately — this drains queues with multiple items without waiting
+/// for a new subscription fire between each pop.
+pub struct WatchFuture<'a, T> {
+    watcher: &'a mut Watcher,
+    _marker: core::marker::PhantomData<T>,
+}
+
+impl<T: FromStoreBytes> Future for WatchFuture<'_, T> {
+    type Output = Option<T>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let bit = 1u64 << self.watcher.sub_id;
+        let old_mask = READY_MASK.fetch_and(!bit, Ordering::SeqCst);
+        if old_mask & bit != 0 {
+            match store_get::<T>(self.watcher.store_id, self.watcher.field) {
+                Ok(val) if !val.is_empty() => {
+                    // Re-set the bit so the next next() call also tries
+                    // a GET immediately. This drains multi-item queues
+                    // without waiting for a new push between each pop.
+                    READY_MASK.fetch_or(bit, Ordering::SeqCst);
+                    Poll::Ready(Some(val))
+                }
+                // GET returned "empty" (e.g. queue drained) or failed.
+                // Don't re-set the bit; wait for the next subscription fire.
+                _ => Poll::Pending,
+            }
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// Create a persistent subscription to a store field.
+///
+/// Returns a [`Watcher`] whose [`next`](Watcher::next) method yields
+/// futures that resolve when the field is written.
+///
+/// ```
+/// let mut input = watch(CONSOLE, "input");
+/// while let Some(byte) = input.next::<Option<u8>>().await {
+///     // process byte
+/// }
+/// ```
+pub fn watch(store_id: u64, field: &'static str) -> Watcher {
+    let sub_id = subscribe(store_id, field).expect("subscribe failed");
+    Watcher { sub_id, store_id, field }
 }
 
 // ————————————————————————————————————————————————————————————————————————————
@@ -333,10 +549,8 @@ pub fn write_u64(buf: &mut [u8], val: u64) -> usize {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // Best-effort: print what we can to serial.
     write("!!! USERSPACE PANIC !!!\n");
 
-    // We can't use format! (no alloc), so just print the static parts.
     if let Some(location) = info.location() {
         write(location.file());
         write(":");

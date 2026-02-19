@@ -5,13 +5,13 @@
 //! a value to a kernel store field via syscall, reads it back, and
 //! prints the result to the serial console. Also demos interactive
 //! keyboard input via the console store's `"input"` queue and
-//! `SYS_STORE_WATCH`.
+//! async subscriptions (SYS_SUBSCRIBE/SYS_YIELD).
 
 #![no_std]
 #![no_main]
 
 use liboboos::{
-    exit, getpid, store_get, store_get_u8, store_set, store_watch, write, write_u64,
+    block_on, exit, getpid, store_get, store_set, watch, write, write_u64,
     CONSOLE,
 };
 
@@ -19,6 +19,11 @@ use liboboos::{
 /// kernel via `jump_to_ring3`'s third argument).
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(store_id: u64) -> ! {
+    block_on(main(store_id));
+    exit(0);
+}
+
+async fn main(store_id: u64) {
     write("Hello from userspace Rust!\n");
 
     // Print our PID to prove SYS_STORE_GET works.
@@ -34,10 +39,10 @@ pub extern "C" fn _start(store_id: u64) -> ! {
     write(msg);
 
     // Set counter=42 in the kernel store.
-    store_set(store_id, "counter", 42);
+    store_set(store_id, "counter", 42u64).expect("set counter");
 
     // Read it back to verify the round trip.
-    let val = store_get(store_id, "counter");
+    let val: u64 = store_get(store_id, "counter").expect("get counter");
 
     // Print the result: "Store round-trip OK: counter=NN\n"
     let prefix2 = b"Store round-trip OK: counter=";
@@ -52,26 +57,19 @@ pub extern "C" fn _start(store_id: u64) -> ! {
     // Interactive input: read keyboard input via the console store.
     write("Type something (Enter to finish): ");
 
+    let mut input = watch(CONSOLE, "input");
     loop {
-        // Block until a byte arrives on the console input queue.
-        store_watch(CONSOLE, "input");
-
-        // Pop all available bytes.
-        loop {
-            match store_get_u8(CONSOLE, "input") {
-                Some(b'\n') => {
-                    write("\n");
-                    // Done with input — exit cleanly.
-                    exit(0);
-                }
-                Some(ch) => {
-                    // Echo the character back to the console.
-                    let echo = [ch];
-                    let s = unsafe { core::str::from_utf8_unchecked(&echo) };
-                    write(s);
-                }
-                None => break, // queue empty, go back to watching
+        match input.next::<Option<u8>>().await {
+            Some(Some(b'\n')) => {
+                write("\n");
+                return;
             }
+            Some(Some(ch)) => {
+                let echo = [ch];
+                let s = unsafe { core::str::from_utf8_unchecked(&echo) };
+                write(s);
+            }
+            _ => {}
         }
     }
 }

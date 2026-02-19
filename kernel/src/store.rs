@@ -51,13 +51,14 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::fmt;
 use core::future::Future;
 use core::task::Waker;
 
 use crate::arch::Arch;
 use crate::platform::Platform;
 use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+pub use oboos_api::StoreError;
 
 /// Opaque store identifier — monotonic, never reused.
 ///
@@ -81,27 +82,6 @@ impl StoreId {
     }
 }
 
-/// Errors returned by store operations.
-#[derive(Debug)]
-pub enum StoreError {
-    /// No store with this ID exists (destroyed or never created).
-    NotFound,
-    /// The field name doesn't exist in this store's schema.
-    UnknownField,
-    /// The value's type doesn't match the field's declared kind.
-    TypeMismatch,
-}
-
-impl fmt::Display for StoreError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            StoreError::NotFound => write!(f, "store not found"),
-            StoreError::UnknownField => write!(f, "unknown field"),
-            StoreError::TypeMismatch => write!(f, "type mismatch"),
-        }
-    }
-}
-
 /// A registered subscriber waiting for any of its watched fields to change.
 ///
 /// Each [`watch()`] call creates exactly one subscriber, regardless of
@@ -117,6 +97,19 @@ struct Subscriber {
     waker: Waker,
 }
 
+/// A persistent watcher — not drained on fire, only removed explicitly.
+///
+/// Unlike one-shot [`Subscriber`]s which are consumed when they fire,
+/// persistent watchers stay registered across multiple writes. The waker
+/// is cloned (not consumed) on each fire. Used by the SYS_SUBSCRIBE
+/// syscall to give userspace a stream-like API.
+struct PersistentWatcher {
+    field: &'static str,
+    waker: Waker,
+    /// Unique ID for removal by SYS_UNSUBSCRIBE.
+    id: u64,
+}
+
 /// A live store instance: schema metadata + current field values + subscribers.
 struct StoreInstance {
     fields: &'static [FieldDef],
@@ -124,6 +117,7 @@ struct StoreInstance {
     schema_name: &'static str,
     data: BTreeMap<String, Value>,
     subscribers: Vec<Subscriber>,
+    watchers: Vec<PersistentWatcher>,
 }
 
 /// The global store registry — all live store instances keyed by ID.
@@ -220,6 +214,7 @@ fn create_inner<S: StoreSchema>(defaults: &[(&str, Value)]) -> Result<StoreId, S
             // Pre-allocate subscriber slots so wakers don't hit the allocator
             // on the hot path.
             subscribers: Vec::with_capacity(8),
+            watchers: Vec::new(),
         },
     );
     Ok(StoreId(id))
@@ -334,9 +329,8 @@ fn set_inner(store: StoreId, updates: &[(&str, Value)]) -> Result<(), StoreError
             instance.data.insert(String::from(field), value.clone());
         }
 
-        // Drain subscribers whose watched fields overlap with the written
-        // fields. Each subscriber is a single entry (even if watching
-        // multiple fields), so one wake per watch() call.
+        // Drain one-shot subscribers whose watched fields overlap with
+        // the written fields.
         let mut wakers = Vec::new();
         let mut i = 0;
         while i < instance.subscribers.len() {
@@ -347,6 +341,14 @@ fn set_inner(store: StoreId, updates: &[(&str, Value)]) -> Result<(), StoreError
                 i += 1;
             }
         }
+
+        // Clone wakers from persistent watchers (NOT drained).
+        for watcher in &instance.watchers {
+            if updates.iter().any(|&(f, _)| f == watcher.field) {
+                wakers.push(watcher.waker.clone());
+            }
+        }
+
         wakers
     }; // registry lock dropped here
 
@@ -377,12 +379,17 @@ fn destroy_inner(store: StoreId) -> Result<(), StoreError> {
             .remove(&store.0)
             .ok_or(StoreError::NotFound)?;
 
-        // Wake all subscribers so their futures can observe NotFound.
-        instance
+        // Wake all one-shot subscribers and persistent watchers so their
+        // futures can observe NotFound.
+        let mut wakers: Vec<Waker> = instance
             .subscribers
             .into_iter()
             .map(|s| s.waker)
-            .collect::<Vec<_>>()
+            .collect();
+        for watcher in &instance.watchers {
+            wakers.push(watcher.waker.clone());
+        }
+        wakers
     }; // registry lock dropped here
 
     for w in wakers {
@@ -439,7 +446,7 @@ fn push_inner(store: StoreId, field: &str, value: Value) -> Result<(), StoreErro
             _ => return Err(StoreError::TypeMismatch),
         }
 
-        // Wake subscribers watching this field.
+        // Wake one-shot subscribers watching this field.
         let mut wakers = Vec::new();
         let mut i = 0;
         while i < instance.subscribers.len() {
@@ -449,6 +456,14 @@ fn push_inner(store: StoreId, field: &str, value: Value) -> Result<(), StoreErro
                 i += 1;
             }
         }
+
+        // Clone wakers from persistent watchers (NOT drained).
+        for watcher in &instance.watchers {
+            if watcher.field == field {
+                wakers.push(watcher.waker.clone());
+            }
+        }
+
         wakers
     }; // registry lock dropped here
 
@@ -550,17 +565,18 @@ fn subscribe(store: StoreId, fields: &[&'static str], waker: Waker) -> Result<()
     Ok(())
 }
 
-/// Register a single-field subscriber without touching the interrupt flag.
+/// Register a persistent watcher for a single field, without touching
+/// the interrupt flag. Used by SYS_SUBSCRIBE.
 ///
-/// Used by the SYS_STORE_WATCH syscall handler, which runs with IF=0.
-/// Resolves the `&'static str` from the schema's [`FieldDef`] list so
-/// the subscriber holds a reference with `'static` lifetime (schema
-/// field names are always `&'static str`).
-pub(crate) fn subscribe_no_cli(
+/// Returns `Ok(true)` if the field is a Queue with non-empty data,
+/// signalling the caller should fire the waker immediately to prevent
+/// missed data. Returns `Ok(false)` otherwise.
+pub(crate) fn add_watcher_no_cli(
     store: StoreId,
     field: &str,
     waker: Waker,
-) -> Result<(), StoreError> {
+    watcher_id: u64,
+) -> Result<bool, StoreError> {
     let mut reg = registry().lock();
     let instance = reg.stores.get_mut(&store.0).ok_or(StoreError::NotFound)?;
 
@@ -570,13 +586,35 @@ pub(crate) fn subscribe_no_cli(
         .find(|f| f.name == field)
         .ok_or(StoreError::UnknownField)?;
 
-    // Use the schema's &'static str so the subscriber's lifetime is sound.
+    // Use the schema's &'static str so the watcher's lifetime is sound.
     let static_name: &'static str = field_def.name;
 
-    instance.subscribers.push(Subscriber {
-        fields: alloc::vec![static_name],
+    // Check if the field is a non-empty queue — caller should fire
+    // immediately so userspace doesn't miss already-buffered data.
+    let fire_immediately = matches!(&field_def.kind, FieldKind::Queue(_))
+        && matches!(instance.data.get(field), Some(Value::Queue(q)) if !q.is_empty());
+
+    instance.watchers.push(PersistentWatcher {
+        field: static_name,
         waker,
+        id: watcher_id,
     });
+
+    Ok(fire_immediately)
+}
+
+/// Remove a persistent watcher by its ID, without touching the
+/// interrupt flag. Used by SYS_UNSUBSCRIBE.
+pub(crate) fn remove_watcher_no_cli(
+    store: StoreId,
+    watcher_id: u64,
+) -> Result<(), StoreError> {
+    let mut reg = registry().lock();
+    let instance = reg.stores.get_mut(&store.0).ok_or(StoreError::NotFound)?;
+
+    if let Some(pos) = instance.watchers.iter().position(|w| w.id == watcher_id) {
+        instance.watchers.swap_remove(pos);
+    }
     Ok(())
 }
 

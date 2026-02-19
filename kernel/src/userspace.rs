@@ -100,10 +100,11 @@ pub fn run_ring3_smoke_test() {
     let console_store_id = arch::syscall::create_console_store();
     println!("[user] Created console store (id={})", console_store_id.as_raw());
 
-    // Spawn the async console driver and do an initial poll so its
-    // watch() registers a subscriber before userspace starts writing.
+    // Spawn the async console driver and keyboard input driver, then
+    // do an initial poll so their watch() calls register subscribers
+    // before userspace starts writing.
     executor::spawn(arch::syscall::console_driver());
-    executor::poll_once();
+    executor::spawn(arch::syscall::keyboard_input_driver());
 
     let data_store_id = store::create::<UserTestSchema>(&[
         ("counter", Value::U64(0)),
@@ -117,21 +118,22 @@ pub fn run_ring3_smoke_test() {
 
     // ── Step 7: Drop to Ring 3 ─────────────────────────────────────
     //
-    // The hello program now has an interactive keyboard input loop that
-    // blocks on SYS_STORE_WATCH. To unblock it during smoke tests, we
-    // pre-fill the keyboard buffer with "hi\n" scancodes. The WATCH
-    // handler's busy-wait loop will pick them up, convert them to ASCII,
-    // push them into the console input queue, and the program will read
-    // them and exit on the newline.
+    // The hello program uses SYS_SUBSCRIBE/SYS_YIELD for keyboard input.
+    // During smoke tests, pre-fill the keyboard buffer with "hi\n"
+    // scancodes. The keyboard_input_driver async task converts them to
+    // ASCII and pushes them into the console store's input queue.
     #[cfg(feature = "smoke-test")]
     {
-        // Push scancodes with IF=0 (required by push_scancode).
         arch::Arch::disable_interrupts();
         arch::keyboard::push_scancode(0x23); // 'h' make
         arch::keyboard::push_scancode(0x17); // 'i' make
         arch::keyboard::push_scancode(0x1C); // Enter make
         arch::Arch::enable_interrupts();
     }
+
+    // Initial poll drains any pre-filled scancodes through the input
+    // driver into the console store's input queue.
+    executor::poll_once();
 
     println!("[user] Jumping to Ring 3...");
     arch::keyboard::set_console_mode(true);
@@ -140,7 +142,8 @@ pub fn run_ring3_smoke_test() {
     }
     arch::keyboard::set_console_mode(false);
 
-    // ── Step 8: Back from Ring 3 — clear current and verify ────────
+    // ── Step 8: Back from Ring 3 — clean up subscriptions and verify ─
+    arch::syscall::clear_all_subscriptions();
     process::clear_current();
 
     // Verify the data store was modified by userspace.
@@ -200,6 +203,7 @@ pub fn run_hello_interactive() {
 
     let console_store_id = arch::syscall::create_console_store();
     executor::spawn(arch::syscall::console_driver());
+    executor::spawn(arch::syscall::keyboard_input_driver());
     executor::poll_once();
 
     let data_store_id = store::create::<UserTestSchema>(&[
@@ -216,6 +220,7 @@ pub fn run_hello_interactive() {
     }
     arch::keyboard::set_console_mode(false);
 
+    arch::syscall::clear_all_subscriptions();
     process::clear_current();
 
     // Report exit status.

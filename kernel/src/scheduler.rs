@@ -49,9 +49,9 @@ const PREEMPT_TICKS: u32 = 10;
 static TICKS_REMAINING: AtomicU32 = AtomicU32::new(PREEMPT_TICKS);
 
 /// When true, [`on_tick()`] skips preemptive scheduling even when the
-/// time slice expires. Used by the SYS_STORE_WATCH busy-wait loop to
-/// prevent PIT ticks from preempting us into stale scheduler tasks while
-/// we're polling the executor inside a syscall.
+/// time slice expires. Set while the CPU is inside a syscall handler —
+/// PIT ticks shouldn't preempt us into stale scheduler tasks while
+/// we're servicing a syscall on the kernel stack.
 static PREEMPT_DISABLED: AtomicBool = AtomicBool::new(false);
 
 /// Global scheduler instance. Initialized once from `kmain` via [`init()`],
@@ -178,9 +178,9 @@ pub fn yield_now() {
 /// Suppress preemptive scheduling.
 ///
 /// While disabled, [`on_tick()`] still counts ticks but never calls
-/// [`schedule()`]. Used by the SYS_STORE_WATCH wait loop which needs
-/// to call [`poll_once()`] (enabling interrupts briefly) without
-/// getting preempted into stale scheduler tasks.
+/// [`schedule()`]. Used by the SYS_YIELD wait loop which needs to
+/// call [`poll_once()`] (enabling interrupts briefly) without getting
+/// preempted off the syscall kernel stack.
 pub fn disable_preemption() {
     PREEMPT_DISABLED.store(true, Ordering::SeqCst);
 }

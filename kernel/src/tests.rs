@@ -34,6 +34,7 @@ pub fn run_all() {
     test_process_store_watch();
     test_error_codes();
     test_multi_field_set();
+    test_persistent_watcher();
     test_ring3();
     println!();
     println!("[ok] All smoke tests passed");
@@ -1038,6 +1039,70 @@ fn test_multi_field_set() {
 
     store::destroy(id).expect("cleanup multi store");
     println!("[ok] Multi-field atomic SET verified");
+}
+
+/// Verify that persistent watchers fire on every write, not just the first.
+///
+/// Unlike one-shot subscribers (which are drained after firing), persistent
+/// watchers stay registered. This test creates a store, adds a persistent
+/// watcher, writes the field twice, and verifies the watcher fires both times.
+fn test_persistent_watcher() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+    struct WatcherSchema;
+    impl StoreSchema for WatcherSchema {
+        fn name() -> &'static str { "PersistentWatcher" }
+        fn fields() -> &'static [FieldDef] {
+            &[FieldDef { name: "value", kind: FieldKind::U32 }]
+        }
+    }
+
+    static WAKE_COUNT: AtomicU32 = AtomicU32::new(0);
+    WAKE_COUNT.store(0, Ordering::SeqCst);
+
+    // Custom waker that increments a counter each time it's woken.
+    static COUNT_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |data| RawWaker::new(data, &COUNT_VTABLE),
+        |_| { WAKE_COUNT.fetch_add(1, Ordering::SeqCst); },
+        |_| { WAKE_COUNT.fetch_add(1, Ordering::SeqCst); },
+        |_| {},
+    );
+    let waker = unsafe {
+        Waker::from_raw(RawWaker::new(core::ptr::null(), &COUNT_VTABLE))
+    };
+
+    let id = store::create::<WatcherSchema>(&[
+        ("value", Value::U32(0)),
+    ]).expect("create persistent watcher store");
+
+    // Add a persistent watcher (simulating what SYS_SUBSCRIBE does).
+    arch::Arch::disable_interrupts();
+    store::add_watcher_no_cli(id, "value", waker, 0).expect("add watcher");
+    arch::Arch::enable_interrupts();
+
+    // First write — watcher should fire.
+    store::set(id, &[("value", Value::U32(1))]).expect("set value 1");
+    assert_eq!(WAKE_COUNT.load(Ordering::SeqCst), 1,
+        "persistent watcher should fire on first write");
+
+    // Second write — watcher should fire again (not drained).
+    store::set(id, &[("value", Value::U32(2))]).expect("set value 2");
+    assert_eq!(WAKE_COUNT.load(Ordering::SeqCst), 2,
+        "persistent watcher should fire on second write");
+
+    // Remove the watcher and verify it no longer fires.
+    arch::Arch::disable_interrupts();
+    store::remove_watcher_no_cli(id, 0).expect("remove watcher");
+    arch::Arch::enable_interrupts();
+
+    store::set(id, &[("value", Value::U32(3))]).expect("set value 3");
+    assert_eq!(WAKE_COUNT.load(Ordering::SeqCst), 2,
+        "watcher should not fire after removal");
+
+    store::destroy(id).expect("cleanup persistent watcher store");
+    println!("[ok] Persistent watcher verified (fires on every write, removable)");
 }
 
 /// Verify the Ring 3 store round trip: load an ELF, drop to user mode,

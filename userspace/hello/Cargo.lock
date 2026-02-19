@@ -5,6 +5,13 @@ version = 4
 [[package]]
 name = "liboboos"
 version = "0.0.1"
+dependencies = [
+ "oboos-api",
+]
+
+[[package]]
+name = "oboos-api"
+version = "0.0.1"
 
 [[package]]
 name = "oboos-hello"

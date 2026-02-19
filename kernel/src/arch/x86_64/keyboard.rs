@@ -4,6 +4,14 @@
 //! [`Key`] values. The keyboard IRQ (IRQ 1) pushes scancodes into a
 //! ring buffer; the async [`next_key()`] future drains it.
 //!
+//! ## Console mode
+//!
+//! When console mode is active (during Ring 3 execution), keyboard
+//! scancodes are routed through [`next_console_byte()`] instead of
+//! [`next_key()`]. The IRQ handler wakes the [`CONSOLE_WAKER`] so the
+//! async [`keyboard_input_driver`](super::syscall::keyboard_input_driver)
+//! can translate scancodes to ASCII and push them into the console store.
+//!
 //! ## Interrupt safety
 //!
 //! A single [`spin::Mutex`] protects both the buffer and the waker.
@@ -63,44 +71,41 @@ pub fn init() {
     crate::println!("[ok] Keyboard buffer pre-allocated (32 slots)");
 }
 
-/// When true, keyboard scancodes accumulate in the buffer but do NOT
-/// wake the async [`next_key()`] future. Instead, the SYS_STORE_WATCH
-/// busy-wait loop polls the buffer via [`pop_scancode()`]. This routes
-/// keyboard input to the console store's `"input"` field during Ring 3.
+/// When true, keyboard scancodes wake [`CONSOLE_WAKER`] instead of
+/// `STATE.waker`. This routes keyboard input through the async
+/// [`keyboard_input_driver`](super::syscall::keyboard_input_driver)
+/// during Ring 3 execution.
 static CONSOLE_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Enable or disable console mode.
 ///
-/// When enabled, scancodes buffer silently without waking the async
-/// keyboard future. Call with `true` before entering Ring 3 and
-/// `false` after returning.
+/// When enabled, scancodes wake the console waker instead of the
+/// normal async keyboard future. Call with `true` before entering
+/// Ring 3 and `false` after returning.
 pub fn set_console_mode(enabled: bool) {
     CONSOLE_MODE.store(enabled, Ordering::SeqCst);
 }
+
+/// Waker for the console input driver. Set by [`next_console_byte()`],
+/// woken by the IRQ handler when console mode is active.
+static CONSOLE_WAKER: spin::Mutex<Option<Waker>> = spin::Mutex::new(None);
 
 /// IRQ 1 handler — reads a scancode from port 0x60 and buffers it.
 ///
 /// Runs with IF=0 (interrupt gate), so locking `STATE` is safe.
 /// In normal mode, wakes the async [`next_key()`] future. In console
-/// mode, scancodes just accumulate — the WATCH loop polls them.
+/// mode, wakes the [`CONSOLE_WAKER`] for the keyboard input driver.
 pub fn on_key() {
     let scancode = unsafe { inb(DATA_PORT) };
     let mut state = STATE.lock();
     state.buffer.push_back(scancode);
-    if !CONSOLE_MODE.load(Ordering::SeqCst) {
-        if let Some(waker) = state.waker.take() {
+    if CONSOLE_MODE.load(Ordering::SeqCst) {
+        if let Some(waker) = CONSOLE_WAKER.lock().take() {
             waker.wake();
         }
+    } else if let Some(waker) = state.waker.take() {
+        waker.wake();
     }
-}
-
-/// Pop the oldest scancode from the buffer.
-///
-/// Must be called with IF=0 to avoid deadlocking with the IRQ handler.
-/// Returns `None` if the buffer is empty. Used by the SYS_STORE_WATCH
-/// handler to drain scancodes and convert them to console input.
-pub fn pop_scancode() -> Option<u8> {
-    STATE.lock().buffer.pop_front()
 }
 
 /// Async future that returns the next key press.
@@ -136,6 +141,39 @@ pub fn next_key() -> impl Future<Output = Key> + Send {
     })
 }
 
+/// Async future that returns the next ASCII byte from the keyboard.
+///
+/// Used by the keyboard input driver during console mode. Drains
+/// scancodes from the buffer, skips break codes, translates via
+/// [`scancode_to_ascii`], and returns the first ASCII byte. If the
+/// buffer is empty, stores the waker in [`CONSOLE_WAKER`] and returns
+/// Pending.
+pub fn next_console_byte() -> impl Future<Output = u8> + Send {
+    core::future::poll_fn(|cx| {
+        crate::arch::Arch::disable_interrupts();
+        let mut state = STATE.lock();
+
+        // Drain the buffer looking for a translatable make code.
+        while let Some(scancode) = state.buffer.pop_front() {
+            if scancode & 0x80 != 0 {
+                continue; // release code — skip
+            }
+            if let Some(ascii) = scancode_to_ascii(scancode) {
+                drop(state);
+                crate::arch::Arch::enable_interrupts();
+                return core::task::Poll::Ready(ascii);
+            }
+            // Untranslatable make code (modifier, function key) — skip.
+        }
+
+        // Buffer empty — store waker and return Pending.
+        drop(state);
+        *CONSOLE_WAKER.lock() = Some(cx.waker().clone());
+        crate::arch::Arch::enable_interrupts();
+        core::task::Poll::Pending
+    })
+}
+
 /// Translate a scan code set 1 make code to a [`Key`].
 fn translate_scancode(scancode: u8) -> Key {
     match scancode {
@@ -157,7 +195,12 @@ fn translate_scancode(scancode: u8) -> Key {
 pub fn push_scancode(scancode: u8) {
     let mut state = STATE.lock();
     state.buffer.push_back(scancode);
-    if let Some(waker) = state.waker.take() {
+    // Wake whichever waker is active — console mode or normal mode.
+    if CONSOLE_MODE.load(Ordering::SeqCst) {
+        if let Some(waker) = CONSOLE_WAKER.lock().take() {
+            waker.wake();
+        }
+    } else if let Some(waker) = state.waker.take() {
         waker.wake();
     }
 }
