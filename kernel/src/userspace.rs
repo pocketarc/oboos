@@ -31,6 +31,8 @@ use crate::elf;
 use crate::executor;
 use crate::memory;
 use crate::platform::{MemoryManager, PageFlags};
+use crate::platform::Platform;
+
 use crate::println;
 use crate::process;
 use crate::store;
@@ -114,10 +116,29 @@ pub fn run_ring3_smoke_test() {
     process::start(pid);
 
     // ── Step 7: Drop to Ring 3 ─────────────────────────────────────
+    //
+    // The hello program now has an interactive keyboard input loop that
+    // blocks on SYS_STORE_WATCH. To unblock it during smoke tests, we
+    // pre-fill the keyboard buffer with "hi\n" scancodes. The WATCH
+    // handler's busy-wait loop will pick them up, convert them to ASCII,
+    // push them into the console input queue, and the program will read
+    // them and exit on the newline.
+    #[cfg(feature = "smoke-test")]
+    {
+        // Push scancodes with IF=0 (required by push_scancode).
+        arch::Arch::disable_interrupts();
+        arch::keyboard::push_scancode(0x23); // 'h' make
+        arch::keyboard::push_scancode(0x17); // 'i' make
+        arch::keyboard::push_scancode(0x1C); // Enter make
+        arch::Arch::enable_interrupts();
+    }
+
     println!("[user] Jumping to Ring 3...");
+    arch::keyboard::set_console_mode(true);
     unsafe {
         arch::syscall::jump_to_ring3(loaded.entry, user_rsp, data_store_id.as_raw());
     }
+    arch::keyboard::set_console_mode(false);
 
     // ── Step 8: Back from Ring 3 — clear current and verify ────────
     process::clear_current();
@@ -140,6 +161,74 @@ pub fn run_ring3_smoke_test() {
     // ── Step 9: Clean up ───────────────────────────────────────────
     arch::syscall::destroy_console_store(console_store_id);
     store::destroy(data_store_id).expect("destroy user test store");
+    process::destroy(pid);
+    loaded.unload();
+
+    arch::Arch::unmap_page(USER_STACK_VIRT);
+    memory::free_frame(stack_frame);
+    memory::free_frame(kern_stack_frame);
+}
+
+/// Launch the hello program interactively from the splash screen.
+///
+/// Same setup as [`run_ring3_smoke_test`] but without assertions — just
+/// runs the program, prints the exit status, and cleans up. Keyboard
+/// input is live (no pre-filled scancodes).
+pub fn run_hello_interactive() {
+    // Disable interrupts while we set up (same pattern as the smoke test).
+    arch::Arch::disable_interrupts();
+
+    let pid = process::spawn("hello");
+    println!("[user] Spawned process \"hello\" (pid={})", pid.as_raw());
+
+    let loaded = elf::load_elf(USER_ELF);
+
+    let stack_frame = memory::alloc_frame().expect("alloc user stack frame");
+    arch::Arch::map_page(
+        USER_STACK_VIRT,
+        stack_frame,
+        PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER | PageFlags::NO_EXECUTE,
+    );
+    let user_rsp = (USER_STACK_VIRT + memory::FRAME_SIZE) as u64;
+
+    let kern_stack_frame = memory::alloc_frame().expect("alloc syscall kernel stack");
+    let kern_stack_top = arch::memory::phys_to_virt(kern_stack_frame as u64);
+    let kern_stack_rsp = kern_stack_top as u64 + memory::FRAME_SIZE as u64;
+
+    arch::syscall::set_kernel_rsp(kern_stack_rsp);
+    unsafe { arch::gdt::set_rsp0(kern_stack_rsp); }
+
+    let console_store_id = arch::syscall::create_console_store();
+    executor::spawn(arch::syscall::console_driver());
+    executor::poll_once();
+
+    let data_store_id = store::create::<UserTestSchema>(&[
+        ("counter", Value::U64(0)),
+    ]).expect("create user data store");
+
+    process::set_current(pid);
+    process::start(pid);
+
+    println!("[user] Jumping to Ring 3 (interactive)...");
+    arch::keyboard::set_console_mode(true);
+    unsafe {
+        arch::syscall::jump_to_ring3(loaded.entry, user_rsp, data_store_id.as_raw());
+    }
+    arch::keyboard::set_console_mode(false);
+
+    process::clear_current();
+
+    // Report exit status.
+    let proc_store_id = process::store_id(pid).expect("process store should exist");
+    let exit_code = match store::get(proc_store_id, "exit_code") {
+        Ok(Value::U64(v)) => v,
+        _ => u64::MAX,
+    };
+    println!("[user] Process exited (code={})", exit_code);
+
+    // Clean up.
+    arch::syscall::destroy_console_store(console_store_id);
+    store::destroy(data_store_id).ok();
     process::destroy(pid);
     loaded.unload();
 

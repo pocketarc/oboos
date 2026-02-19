@@ -32,6 +32,8 @@ pub fn run_all() {
     test_store_queue_watch();
     test_process_lifecycle();
     test_process_store_watch();
+    test_error_codes();
+    test_multi_field_set();
     test_ring3();
     println!();
     println!("[ok] All smoke tests passed");
@@ -930,6 +932,112 @@ fn test_process_store_watch() {
 
     process::destroy(pid);
     println!("[ok] Process store watch verified (status transitions observable)");
+}
+
+/// Verify structured error codes from store operations.
+///
+/// Tests that specific error variants (NotFound, UnknownField, TypeMismatch)
+/// are correctly distinguished — not just "it failed" but "it failed for
+/// the right reason."
+fn test_error_codes() {
+    use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+    struct ErrTestSchema;
+    impl StoreSchema for ErrTestSchema {
+        fn name() -> &'static str { "ErrTest" }
+        fn fields() -> &'static [FieldDef] {
+            &[
+                FieldDef { name: "count", kind: FieldKind::U32 },
+                FieldDef { name: "label", kind: FieldKind::Str },
+            ]
+        }
+    }
+
+    let id = store::create::<ErrTestSchema>(&[
+        ("count", Value::U32(0)),
+        ("label", Value::Str(alloc::string::String::from("test"))),
+    ]).expect("create err test store");
+
+    // NotFound: get/set on a non-existent store ID.
+    let bogus = store::StoreId::from_raw(99999);
+    match store::get(bogus, "count") {
+        Err(store::StoreError::NotFound) => {}
+        other => panic!("expected NotFound, got {:?}", other),
+    }
+    match store::set(bogus, &[("count", Value::U32(1))]) {
+        Err(store::StoreError::NotFound) => {}
+        other => panic!("expected NotFound on set, got {:?}", other),
+    }
+
+    // UnknownField: get/set a field that doesn't exist in the schema.
+    match store::get(id, "nonexistent") {
+        Err(store::StoreError::UnknownField) => {}
+        other => panic!("expected UnknownField, got {:?}", other),
+    }
+    match store::set(id, &[("nonexistent", Value::U32(1))]) {
+        Err(store::StoreError::UnknownField) => {}
+        other => panic!("expected UnknownField on set, got {:?}", other),
+    }
+
+    // TypeMismatch: write wrong type.
+    match store::set(id, &[("count", Value::Bool(true))]) {
+        Err(store::StoreError::TypeMismatch) => {}
+        other => panic!("expected TypeMismatch, got {:?}", other),
+    }
+
+    store::destroy(id).expect("cleanup err test store");
+    println!("[ok] Structured error codes verified (NotFound, UnknownField, TypeMismatch)");
+}
+
+/// Verify multi-field atomic SET: write two fields at once and verify
+/// both are updated atomically.
+fn test_multi_field_set() {
+    use alloc::string::String;
+    use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+    struct MultiSchema;
+    impl StoreSchema for MultiSchema {
+        fn name() -> &'static str { "MultiSet" }
+        fn fields() -> &'static [FieldDef] {
+            &[
+                FieldDef { name: "x", kind: FieldKind::U32 },
+                FieldDef { name: "y", kind: FieldKind::U32 },
+                FieldDef { name: "name", kind: FieldKind::Str },
+            ]
+        }
+    }
+
+    let id = store::create::<MultiSchema>(&[
+        ("x", Value::U32(0)),
+        ("y", Value::U32(0)),
+        ("name", Value::Str(String::from("init"))),
+    ]).expect("create multi store");
+
+    // Write two fields atomically.
+    store::set(id, &[
+        ("x", Value::U32(10)),
+        ("y", Value::U32(20)),
+    ]).expect("multi set x,y");
+
+    // Verify both were written.
+    assert_eq!(store::get(id, "x").unwrap(), Value::U32(10));
+    assert_eq!(store::get(id, "y").unwrap(), Value::U32(20));
+    // Third field should be unchanged.
+    assert_eq!(store::get(id, "name").unwrap(), Value::Str(String::from("init")));
+
+    // All-or-nothing: if one field in a batch has wrong type, nothing changes.
+    let x_before = store::get(id, "x").unwrap();
+    match store::set(id, &[
+        ("x", Value::U32(99)),
+        ("y", Value::Bool(false)), // wrong type for U32 field
+    ]) {
+        Err(store::StoreError::TypeMismatch) => {}
+        other => panic!("expected TypeMismatch, got {:?}", other),
+    }
+    assert_eq!(store::get(id, "x").unwrap(), x_before, "x should be unchanged after failed batch");
+
+    store::destroy(id).expect("cleanup multi store");
+    println!("[ok] Multi-field atomic SET verified");
 }
 
 /// Verify the Ring 3 store round trip: load an ELF, drop to user mode,

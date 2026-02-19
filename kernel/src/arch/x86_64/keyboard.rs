@@ -15,6 +15,7 @@ extern crate alloc;
 
 use alloc::collections::VecDeque;
 use core::future::Future;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
 
 use crate::platform::{Key, Platform};
@@ -27,6 +28,7 @@ const DATA_PORT: u16 = 0x60;
 // These are "make codes" (key press). Release codes are make + 0x80.
 const SC_ENTER: u8 = 0x1C;
 const SC_F: u8 = 0x21;
+const SC_H: u8 = 0x23;
 const SC_T: u8 = 0x14;
 
 /// Shared keyboard state: scancode buffer + async waker.
@@ -61,18 +63,44 @@ pub fn init() {
     crate::println!("[ok] Keyboard buffer pre-allocated (32 slots)");
 }
 
+/// When true, keyboard scancodes accumulate in the buffer but do NOT
+/// wake the async [`next_key()`] future. Instead, the SYS_STORE_WATCH
+/// busy-wait loop polls the buffer via [`pop_scancode()`]. This routes
+/// keyboard input to the console store's `"input"` field during Ring 3.
+static CONSOLE_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable console mode.
+///
+/// When enabled, scancodes buffer silently without waking the async
+/// keyboard future. Call with `true` before entering Ring 3 and
+/// `false` after returning.
+pub fn set_console_mode(enabled: bool) {
+    CONSOLE_MODE.store(enabled, Ordering::SeqCst);
+}
+
 /// IRQ 1 handler — reads a scancode from port 0x60 and buffers it.
 ///
 /// Runs with IF=0 (interrupt gate), so locking `STATE` is safe.
-/// If an async future is waiting via [`next_key()`], wakes it so
-/// the executor will re-poll on the next [`crate::executor::poll_once()`].
+/// In normal mode, wakes the async [`next_key()`] future. In console
+/// mode, scancodes just accumulate — the WATCH loop polls them.
 pub fn on_key() {
     let scancode = unsafe { inb(DATA_PORT) };
     let mut state = STATE.lock();
     state.buffer.push_back(scancode);
-    if let Some(waker) = state.waker.take() {
-        waker.wake();
+    if !CONSOLE_MODE.load(Ordering::SeqCst) {
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
     }
+}
+
+/// Pop the oldest scancode from the buffer.
+///
+/// Must be called with IF=0 to avoid deadlocking with the IRQ handler.
+/// Returns `None` if the buffer is empty. Used by the SYS_STORE_WATCH
+/// handler to drain scancodes and convert them to console input.
+pub fn pop_scancode() -> Option<u8> {
+    STATE.lock().buffer.pop_front()
 }
 
 /// Async future that returns the next key press.
@@ -113,6 +141,7 @@ fn translate_scancode(scancode: u8) -> Key {
     match scancode {
         SC_ENTER => Key::Enter,
         SC_F => Key::F,
+        SC_H => Key::H,
         SC_T => Key::T,
         other => Key::Other(other),
     }
@@ -130,5 +159,98 @@ pub fn push_scancode(scancode: u8) {
     state.buffer.push_back(scancode);
     if let Some(waker) = state.waker.take() {
         waker.wake();
+    }
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// Scancode → ASCII translation
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Scan code set 1 → ASCII lookup table (128 entries, make codes only).
+///
+/// Covers printable ASCII: lowercase letters, digits, basic punctuation,
+/// plus Enter (→ `\n`), Backspace (→ 0x08), and Space (→ 0x20).
+/// Unmapped scancodes have value 0.
+///
+/// This table represents the US QWERTY layout without shift — good enough
+/// for a first interactive console. Shift/caps support comes later.
+static SCANCODE_TO_ASCII: [u8; 128] = {
+    let mut table = [0u8; 128];
+
+    // Row 1: digits and symbols
+    table[0x02] = b'1';
+    table[0x03] = b'2';
+    table[0x04] = b'3';
+    table[0x05] = b'4';
+    table[0x06] = b'5';
+    table[0x07] = b'6';
+    table[0x08] = b'7';
+    table[0x09] = b'8';
+    table[0x0A] = b'9';
+    table[0x0B] = b'0';
+    table[0x0C] = b'-';
+    table[0x0D] = b'=';
+    table[0x0E] = 0x08; // Backspace
+
+    // Row 2: QWERTYUIOP
+    table[0x10] = b'q';
+    table[0x11] = b'w';
+    table[0x12] = b'e';
+    table[0x13] = b'r';
+    table[0x14] = b't';
+    table[0x15] = b'y';
+    table[0x16] = b'u';
+    table[0x17] = b'i';
+    table[0x18] = b'o';
+    table[0x19] = b'p';
+    table[0x1A] = b'[';
+    table[0x1B] = b']';
+    table[0x1C] = b'\n'; // Enter
+
+    // Row 3: ASDFGHJKL
+    table[0x1E] = b'a';
+    table[0x1F] = b's';
+    table[0x20] = b'd';
+    table[0x21] = b'f';
+    table[0x22] = b'g';
+    table[0x23] = b'h';
+    table[0x24] = b'j';
+    table[0x25] = b'k';
+    table[0x26] = b'l';
+    table[0x27] = b';';
+    table[0x28] = b'\'';
+    table[0x29] = b'`';
+
+    // Row 4: ZXCVBNM
+    table[0x2B] = b'\\';
+    table[0x2C] = b'z';
+    table[0x2D] = b'x';
+    table[0x2E] = b'c';
+    table[0x2F] = b'v';
+    table[0x30] = b'b';
+    table[0x31] = b'n';
+    table[0x32] = b'm';
+    table[0x33] = b',';
+    table[0x34] = b'.';
+    table[0x35] = b'/';
+
+    // Space bar
+    table[0x39] = b' ';
+
+    table
+};
+
+/// Convert a scan code set 1 make code to an ASCII byte.
+///
+/// Returns `Some(ascii)` for printable characters, Enter, Backspace,
+/// and Space. Returns `None` for unmapped scancodes (function keys,
+/// modifiers, etc.).
+pub fn scancode_to_ascii(scancode: u8) -> Option<u8> {
+    let idx = scancode as usize;
+    if idx < SCANCODE_TO_ASCII.len() {
+        let ch = SCANCODE_TO_ASCII[idx];
+        if ch != 0 { Some(ch) } else { None }
+    } else {
+        None
     }
 }

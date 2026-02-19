@@ -107,8 +107,13 @@ impl fmt::Display for StoreError {
 /// Each [`watch()`] call creates exactly one subscriber, regardless of
 /// how many fields are watched. This prevents duplicate wakes when
 /// [`set()`] writes multiple watched fields atomically.
+///
+/// `fields` is a `Vec` so both kernel-side watchers (passing static
+/// slices that `.to_vec()`) and the syscall path (constructing a
+/// single-field vec from a dynamically-resolved `&'static str`) can
+/// create subscribers without lifetime gymnastics.
 struct Subscriber {
-    fields: &'static [&'static str],
+    fields: Vec<&'static str>,
     waker: Waker,
 }
 
@@ -335,7 +340,7 @@ fn set_inner(store: StoreId, updates: &[(&str, Value)]) -> Result<(), StoreError
         let mut wakers = Vec::new();
         let mut i = 0;
         while i < instance.subscribers.len() {
-            let sub_fields = instance.subscribers[i].fields;
+            let sub_fields = &instance.subscribers[i].fields;
             if updates.iter().any(|&(f, _)| sub_fields.contains(&f)) {
                 wakers.push(instance.subscribers.swap_remove(i).waker);
             } else {
@@ -438,7 +443,7 @@ fn push_inner(store: StoreId, field: &str, value: Value) -> Result<(), StoreErro
         let mut wakers = Vec::new();
         let mut i = 0;
         while i < instance.subscribers.len() {
-            if instance.subscribers[i].fields.contains(&field) {
+            if instance.subscribers[i].fields.iter().any(|&f| f == field) {
                 wakers.push(instance.subscribers.swap_remove(i).waker);
             } else {
                 i += 1;
@@ -531,7 +536,7 @@ fn drain_inner(store: StoreId, field: &str) -> Result<Vec<Value>, StoreError> {
 /// Validates that every field exists in the schema, then pushes a
 /// single [`Subscriber`] covering all watched fields. Called from
 /// [`watch()`]'s first poll.
-fn subscribe(store: StoreId, fields: &'static [&'static str], waker: Waker) -> Result<(), StoreError> {
+fn subscribe(store: StoreId, fields: &[&'static str], waker: Waker) -> Result<(), StoreError> {
     let mut reg = registry().lock();
     let instance = reg.stores.get_mut(&store.0).ok_or(StoreError::NotFound)?;
 
@@ -541,7 +546,37 @@ fn subscribe(store: StoreId, fields: &'static [&'static str], waker: Waker) -> R
         }
     }
 
-    instance.subscribers.push(Subscriber { fields, waker });
+    instance.subscribers.push(Subscriber { fields: fields.to_vec(), waker });
+    Ok(())
+}
+
+/// Register a single-field subscriber without touching the interrupt flag.
+///
+/// Used by the SYS_STORE_WATCH syscall handler, which runs with IF=0.
+/// Resolves the `&'static str` from the schema's [`FieldDef`] list so
+/// the subscriber holds a reference with `'static` lifetime (schema
+/// field names are always `&'static str`).
+pub(crate) fn subscribe_no_cli(
+    store: StoreId,
+    field: &str,
+    waker: Waker,
+) -> Result<(), StoreError> {
+    let mut reg = registry().lock();
+    let instance = reg.stores.get_mut(&store.0).ok_or(StoreError::NotFound)?;
+
+    let field_def = instance
+        .fields
+        .iter()
+        .find(|f| f.name == field)
+        .ok_or(StoreError::UnknownField)?;
+
+    // Use the schema's &'static str so the subscriber's lifetime is sound.
+    let static_name: &'static str = field_def.name;
+
+    instance.subscribers.push(Subscriber {
+        fields: alloc::vec![static_name],
+        waker,
+    });
     Ok(())
 }
 

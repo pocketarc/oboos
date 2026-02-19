@@ -176,6 +176,7 @@ extern "C" fn kmain() -> ! {
             draw_splash(fbi, framebuffer::Color::DARK_BLUE);
             println!("[ok] Press Enter to randomize colors!");
             println!("[ok] Press F to trigger a divide-by-zero fault.");
+            println!("[ok] Press H to launch hello (interactive console).");
             println!("[ok] Press T to show uptime.");
 
             // Create the system monitor store — updated every second, watched
@@ -292,6 +293,11 @@ async fn keyboard_task(app_store: StoreId) {
                 println!("[!!] IDT installed — expect a panic message.");
                 arch::Arch::trigger_test_fault();
             }
+            Key::H => {
+                println!("[ok] Launching hello program...");
+                userspace::run_hello_interactive();
+                println!("[ok] Back to splash screen.");
+            }
             Key::T => {
                 let ms = arch::Arch::elapsed_ms();
                 println!("[time] {}.{:03} seconds", ms / 1000, ms % 1000);
@@ -406,7 +412,7 @@ fn draw_splash(fb: &FramebufferInfo, bg: framebuffer::Color) {
 
     let title = "OBOOS v0.0";
     let subtitle = "Off By One Operating System";
-    let hint = "Enter = colors / F = fault / T = uptime";
+    let hint = "Enter=colors / F=fault / H=hello / T=uptime";
     let title_x = (fb.width - title.len() * 8) / 2;
     let subtitle_x = (fb.width - subtitle.len() * 8) / 2;
     let hint_x = (fb.width - hint.len() * 8) / 2;

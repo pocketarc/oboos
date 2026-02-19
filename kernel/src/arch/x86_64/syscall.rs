@@ -20,16 +20,17 @@
 //!
 //! ## Syscall interface
 //!
-//! Only two syscalls exist — everything is expressed through the store:
+//! Three syscalls express all kernel interaction through the store:
 //!
-//! | # | Name          | Args                                                  | Returns            |
-//! |---|---------------|-------------------------------------------------------|--------------------|
-//! | 0 | SYS_STORE_GET | store_id, field_ptr, field_len, out_ptr, out_len      | bytes written      |
-//! | 1 | SYS_STORE_SET | store_id, field_ptr, field_len, value_ptr, value_len  | 0 on success       |
+//! | # | Name            | Args                                               | Returns            |
+//! |---|-----------------|----------------------------------------------------|--------------------|
+//! | 0 | SYS_STORE_GET   | store_id, fields_ptr, fields_len, out_ptr, out_len | bytes written      |
+//! | 1 | SYS_STORE_SET   | store_id, buf_ptr, buf_len, 0, 0                   | 0 on success       |
+//! | 2 | SYS_STORE_WATCH | store_id, field_ptr, field_len, 0, 0               | 0 on success       |
 //!
-//! Both return `u64::MAX` on error. The kernel uses the field's [`FieldKind`]
-//! from the schema to interpret raw bytes — no type information crosses the
-//! syscall boundary.
+//! GET and SET use packed buffers for multi-field operations. Each field
+//! name or value is prefixed with a `u16` length. Errors return structured
+//! codes from [`oboos_api::error`] instead of a flat `u64::MAX`.
 //!
 //! ## Well-known store IDs
 //!
@@ -44,9 +45,9 @@
 //! driver is one such task — it watches `CONSOLE`/`"output"` (a Queue(Str)
 //! field) and drains messages to serial.
 //!
-//! The only synchronous side-effect left is process exit:
-//! - `PROCESS`/`"status"` = `"exiting"` → reads `exit_code`, triggers process
-//!   exit and longjmp back to [`jump_to_ring3`]'s caller
+//! The only synchronous side-effect left is process exit: when SET writes
+//! `"status"` = `"exiting"` on the process store, the kernel reads `exit_code`,
+//! triggers process exit, and longjmps back to [`jump_to_ring3`]'s caller.
 //!
 //! ## Register convention
 //!
@@ -76,12 +77,14 @@ extern crate alloc;
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::arch::naked_asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::task::{RawWaker, RawWakerVTable, Waker};
 
 use crate::platform::{Platform, SerialConsole};
 use crate::process;
-use crate::store::{self, StoreId};
+use crate::store::{self, StoreError, StoreId};
 use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
 
 // ————————————————————————————————————————————————————————————————————————————
@@ -102,6 +105,7 @@ const EFER_SCE: u64 = 1 << 0;
 
 const SYS_STORE_GET: u64 = 0;
 const SYS_STORE_SET: u64 = 1;
+const SYS_STORE_WATCH: u64 = 2;
 
 // ————————————————————————————————————————————————————————————————————————————
 // Well-known store IDs
@@ -115,18 +119,21 @@ const WELL_KNOWN_BIT: u64 = 1 << 63;
 // Console store
 // ————————————————————————————————————————————————————————————————————————————
 
-/// Schema for the console device store — a string queue that the async
-/// console driver drains to serial.
+/// Schema for the console device store — bidirectional I/O through queues.
 ///
-/// SET on `"output"` pushes a string onto the queue (schema-driven
-/// behavior — no special-case code in the syscall handler). The console
-/// driver watches the queue and writes bytes to serial.
+/// - `"output"` (Queue(Str)) — userspace pushes strings; the async console
+///   driver drains them to serial.
+/// - `"input"` (Queue(U8)) — the keyboard IRQ handler pushes ASCII bytes
+///   during Ring 3; userspace pops them via WATCH + GET.
 struct ConsoleSchema;
 
 impl StoreSchema for ConsoleSchema {
     fn name() -> &'static str { "Console" }
     fn fields() -> &'static [FieldDef] {
-        &[FieldDef { name: "output", kind: FieldKind::Queue(&FieldKind::Str) }]
+        &[
+            FieldDef { name: "output", kind: FieldKind::Queue(&FieldKind::Str) },
+            FieldDef { name: "input",  kind: FieldKind::Queue(&FieldKind::U8) },
+        ]
     }
 }
 
@@ -142,6 +149,7 @@ static CONSOLE_STORE_ID: AtomicU64 = AtomicU64::new(u64::MAX);
 pub fn create_console_store() -> StoreId {
     let id = store::create::<ConsoleSchema>(&[
         ("output", Value::Queue(VecDeque::new())),
+        ("input",  Value::Queue(VecDeque::new())),
     ]).expect("create console store");
     CONSOLE_STORE_ID.store(id.as_raw(), Ordering::Relaxed);
     id
@@ -431,19 +439,33 @@ unsafe extern "C" fn syscall_entry() {
 /// Called from [`syscall_entry`] with interrupts disabled (FMASK clears IF).
 /// Arguments arrive in System V order after the entry stub's register shuffle.
 ///
-/// Only two syscalls exist — GET and SET. Everything (process identity,
-/// console output, process exit) is expressed through well-known store IDs
-/// and side-effects triggered by specific field writes.
+/// Three syscalls — GET, SET, WATCH. Everything (process identity,
+/// console output, console input, process exit) is expressed through
+/// well-known store IDs and side-effects triggered by specific field writes.
 extern "C" fn syscall_handler(
     number: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
 ) -> u64 {
     match number {
         SYS_STORE_GET => handle_store_get(arg1, arg2, arg3, arg4, arg5),
         SYS_STORE_SET => handle_store_set(arg1, arg2, arg3, arg4, arg5),
+        SYS_STORE_WATCH => handle_store_watch(arg1, arg2, arg3),
         _ => {
             crate::println!("[syscall] unknown: {}", number);
-            u64::MAX
+            oboos_api::ERR_INVALID_ARG
         }
+    }
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// Error mapping
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Map a [`StoreError`] to the corresponding structured error code.
+fn map_store_error(e: &StoreError) -> u64 {
+    match e {
+        StoreError::NotFound => oboos_api::ERR_NOT_FOUND,
+        StoreError::UnknownField => oboos_api::ERR_UNKNOWN_FIELD,
+        StoreError::TypeMismatch => oboos_api::ERR_TYPE_MISMATCH,
     }
 }
 
@@ -493,11 +515,11 @@ fn deserialize_value(kind: &FieldKind, bytes: &[u8]) -> Option<Value> {
     }
 }
 
-/// Serialize a scalar [`Value`] into a byte buffer.
+/// Serialize a scalar [`Value`] into `out_buf`, returning the byte count.
 ///
-/// Returns the number of bytes written, or `None` for `Queue` values
-/// (which can't be serialized as a single blob).
-fn serialize_value(value: &Value, out_buf: &mut [u8]) -> Option<u64> {
+/// Returns `None` for `Queue` values (can't be serialized as a single blob)
+/// or if the output buffer is too small.
+fn serialize_value(value: &Value, out_buf: &mut [u8]) -> Option<usize> {
     match value {
         Value::U64(v) => {
             if out_buf.len() < 8 { return None; }
@@ -516,9 +538,9 @@ fn serialize_value(value: &Value, out_buf: &mut [u8]) -> Option<u64> {
         }
         Value::Str(s) => {
             let src = s.as_bytes();
-            let copy_len = src.len().min(out_buf.len());
-            out_buf[..copy_len].copy_from_slice(&src[..copy_len]);
-            Some(copy_len as u64)
+            if out_buf.len() < src.len() { return None; }
+            out_buf[..src.len()].copy_from_slice(src);
+            Some(src.len())
         }
         Value::Bool(b) => {
             if out_buf.is_empty() { return None; }
@@ -534,137 +556,235 @@ fn serialize_value(value: &Value, out_buf: &mut [u8]) -> Option<u64> {
     }
 }
 
+// ————————————————————————————————————————————————————————————————————————————
+// SYS_STORE_GET — multi-field packed buffer read
+// ————————————————————————————————————————————————————————————————————————————
+
 /// Handle SYS_STORE_GET (syscall 0).
 ///
-/// Reads a field from a store and serializes the value into the caller's
-/// output buffer. For scalar fields, reads the current value. For Queue
-/// fields, pops the front element (returns 0 bytes if the queue is empty).
+/// Input buffer contains packed field names: `[u16 name_len, name bytes, ...]`.
+/// Output buffer receives packed values: `[u16 val_len, val bytes, ...]`.
+/// For Queue fields, pops the front element (val_len=0 if empty).
+/// For scalar fields, reads the current value.
 ///
-/// Returns the number of bytes written, or `u64::MAX` on error.
+/// Returns total bytes written to the output buffer, or a structured
+/// error code on failure.
 fn handle_store_get(
-    store_id_raw: u64, field_ptr: u64, field_len: u64, out_ptr: u64, out_len: u64,
+    store_id_raw: u64, fields_ptr: u64, fields_len: u64, out_ptr: u64, out_len: u64,
 ) -> u64 {
-    if !validate_user_ptr(field_ptr, field_len) || !validate_user_ptr(out_ptr, out_len) {
-        return u64::MAX;
+    if !validate_user_ptr(fields_ptr, fields_len) || !validate_user_ptr(out_ptr, out_len) {
+        return oboos_api::ERR_INVALID_ARG;
     }
 
-    let field_bytes = unsafe {
-        core::slice::from_raw_parts(field_ptr as *const u8, field_len as usize)
+    let fields_buf = unsafe {
+        core::slice::from_raw_parts(fields_ptr as *const u8, fields_len as usize)
     };
-    let field_name = match core::str::from_utf8(field_bytes) {
-        Ok(s) => s,
-        Err(_) => return u64::MAX,
-    };
-
-    let id = match resolve_store_id(store_id_raw) {
-        Some(id) => id,
-        None => return u64::MAX,
-    };
-
-    let kind = match store::field_kind_no_cli(id, field_name) {
-        Ok(k) => k,
-        Err(_) => return u64::MAX,
-    };
-
     let out_buf = unsafe {
         core::slice::from_raw_parts_mut(out_ptr as *mut u8, out_len as usize)
     };
 
-    match kind {
-        FieldKind::Queue(_) => {
-            // Pop one element from the queue. Empty queue → 0 bytes.
-            match store::pop_no_cli(id, field_name) {
-                Ok(Some(value)) => serialize_value(&value, out_buf).unwrap_or(u64::MAX),
-                Ok(None) => 0,
-                Err(_) => u64::MAX,
+    let id = match resolve_store_id(store_id_raw) {
+        Some(id) => id,
+        None => return oboos_api::ERR_NOT_FOUND,
+    };
+
+    // Parse field names from the input buffer.
+    let mut field_names: Vec<&str> = Vec::new();
+    let mut off = 0usize;
+    while off < fields_buf.len() {
+        if off + 2 > fields_buf.len() {
+            return oboos_api::ERR_INVALID_ARG;
+        }
+        let name_len = u16::from_le_bytes([fields_buf[off], fields_buf[off + 1]]) as usize;
+        off += 2;
+        if off + name_len > fields_buf.len() {
+            return oboos_api::ERR_INVALID_ARG;
+        }
+        match core::str::from_utf8(&fields_buf[off..off + name_len]) {
+            Ok(s) => field_names.push(s),
+            Err(_) => return oboos_api::ERR_INVALID_ARG,
+        }
+        off += name_len;
+    }
+
+    // For each field, read/pop the value and write it into the output buffer.
+    let mut out_off = 0usize;
+    for field_name in &field_names {
+        let kind = match store::field_kind_no_cli(id, field_name) {
+            Ok(k) => k,
+            Err(e) => return map_store_error(&e),
+        };
+
+        match kind {
+            FieldKind::Queue(_) => {
+                match store::pop_no_cli(id, field_name) {
+                    Ok(Some(value)) => {
+                        // Serialize value into a temp buffer to get its length.
+                        let mut tmp = [0u8; 1024];
+                        let val_len = match serialize_value(&value, &mut tmp) {
+                            Some(n) => n,
+                            None => return oboos_api::ERR_INVALID_ARG,
+                        };
+                        // Write u16 length prefix + value bytes.
+                        if out_off + 2 + val_len > out_buf.len() {
+                            return oboos_api::ERR_INVALID_ARG;
+                        }
+                        out_buf[out_off..out_off + 2].copy_from_slice(&(val_len as u16).to_le_bytes());
+                        out_off += 2;
+                        out_buf[out_off..out_off + val_len].copy_from_slice(&tmp[..val_len]);
+                        out_off += val_len;
+                    }
+                    Ok(None) => {
+                        // Empty queue → val_len = 0.
+                        if out_off + 2 > out_buf.len() {
+                            return oboos_api::ERR_INVALID_ARG;
+                        }
+                        out_buf[out_off..out_off + 2].copy_from_slice(&0u16.to_le_bytes());
+                        out_off += 2;
+                    }
+                    Err(e) => return map_store_error(&e),
+                }
+            }
+            _ => {
+                let value = match store::get_no_cli(id, field_name) {
+                    Ok(v) => v,
+                    Err(e) => return map_store_error(&e),
+                };
+                let mut tmp = [0u8; 1024];
+                let val_len = match serialize_value(&value, &mut tmp) {
+                    Some(n) => n,
+                    None => return oboos_api::ERR_INVALID_ARG,
+                };
+                if out_off + 2 + val_len > out_buf.len() {
+                    return oboos_api::ERR_INVALID_ARG;
+                }
+                out_buf[out_off..out_off + 2].copy_from_slice(&(val_len as u16).to_le_bytes());
+                out_off += 2;
+                out_buf[out_off..out_off + val_len].copy_from_slice(&tmp[..val_len]);
+                out_off += val_len;
             }
         }
-        _ => {
-            let value = match store::get_no_cli(id, field_name) {
-                Ok(v) => v,
-                Err(_) => return u64::MAX,
-            };
-            serialize_value(&value, out_buf).unwrap_or(u64::MAX)
-        }
     }
+
+    out_off as u64
 }
+
+// ————————————————————————————————————————————————————————————————————————————
+// SYS_STORE_SET — multi-field packed buffer write
+// ————————————————————————————————————————————————————————————————————————————
 
 /// Handle SYS_STORE_SET (syscall 1).
 ///
-/// Interprets raw bytes from the caller according to the field's [`FieldKind`]
-/// and writes the resulting [`Value`] to the store. For scalar fields, this is
-/// a normal `set`. For Queue fields, the value is pushed onto the back.
+/// The input buffer contains packed field/value pairs:
+/// `[u16 name_len, name, u16 value_len, value, ...]`.
 ///
-/// After a successful write, checks for the process-exit side-effect, then
-/// calls [`poll_once()`] to let async tasks (like the console driver) process
-/// the new data before returning to userspace.
+/// Scalar fields are written atomically (all-or-nothing). Queue fields
+/// are pushed individually. After a successful write, checks for the
+/// process-exit side-effect and calls [`poll_once()`].
 ///
-/// Returns 0 on success, `u64::MAX` on error.
+/// Returns 0 on success, or a structured error code on failure.
 fn handle_store_set(
-    store_id_raw: u64, field_ptr: u64, field_len: u64, value_ptr: u64, value_len: u64,
+    store_id_raw: u64, buf_ptr: u64, buf_len: u64, _arg4: u64, _arg5: u64,
 ) -> u64 {
-    if !validate_user_ptr(field_ptr, field_len) || !validate_user_ptr(value_ptr, value_len) {
-        return u64::MAX;
+    if !validate_user_ptr(buf_ptr, buf_len) {
+        return oboos_api::ERR_INVALID_ARG;
     }
 
-    let field_bytes = unsafe {
-        core::slice::from_raw_parts(field_ptr as *const u8, field_len as usize)
-    };
-    let field_name = match core::str::from_utf8(field_bytes) {
-        Ok(s) => s,
-        Err(_) => return u64::MAX,
+    let buf = unsafe {
+        core::slice::from_raw_parts(buf_ptr as *const u8, buf_len as usize)
     };
 
     let id = match resolve_store_id(store_id_raw) {
         Some(id) => id,
-        None => return u64::MAX,
+        None => return oboos_api::ERR_NOT_FOUND,
     };
 
-    let kind = match store::field_kind_no_cli(id, field_name) {
-        Ok(k) => k,
-        Err(_) => return u64::MAX,
-    };
+    // Parse all field/value pairs from the buffer.
+    struct Entry<'a> {
+        name: &'a str,
+        value_bytes: &'a [u8],
+    }
 
-    let value_bytes = unsafe {
-        core::slice::from_raw_parts(value_ptr as *const u8, value_len as usize)
-    };
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut off = 0usize;
 
-    // Branch on scalar vs queue: SET on a Queue field pushes one element.
-    match kind {
-        FieldKind::Queue(inner) => {
-            let value = match deserialize_value(inner, value_bytes) {
-                Some(v) => v,
-                None => return u64::MAX,
-            };
-            if store::push_no_cli(id, field_name, value).is_err() {
-                return u64::MAX;
+    while off < buf.len() {
+        // Parse name_len + name.
+        if off + 2 > buf.len() { return oboos_api::ERR_INVALID_ARG; }
+        let name_len = u16::from_le_bytes([buf[off], buf[off + 1]]) as usize;
+        off += 2;
+        if off + name_len > buf.len() { return oboos_api::ERR_INVALID_ARG; }
+        let name = match core::str::from_utf8(&buf[off..off + name_len]) {
+            Ok(s) => s,
+            Err(_) => return oboos_api::ERR_INVALID_ARG,
+        };
+        off += name_len;
+
+        // Parse value_len + value.
+        if off + 2 > buf.len() { return oboos_api::ERR_INVALID_ARG; }
+        let value_len = u16::from_le_bytes([buf[off], buf[off + 1]]) as usize;
+        off += 2;
+        if off + value_len > buf.len() { return oboos_api::ERR_INVALID_ARG; }
+        let value_bytes = &buf[off..off + value_len];
+        off += value_len;
+
+        entries.push(Entry { name, value_bytes });
+    }
+
+    // Separate queue pushes from scalar sets.
+    let mut scalar_updates: Vec<(&str, Value)> = Vec::new();
+    let mut has_status_exiting = false;
+
+    for entry in &entries {
+        let kind = match store::field_kind_no_cli(id, entry.name) {
+            Ok(k) => k,
+            Err(e) => return map_store_error(&e),
+        };
+
+        match kind {
+            FieldKind::Queue(inner) => {
+                let value = match deserialize_value(inner, entry.value_bytes) {
+                    Some(v) => v,
+                    None => return oboos_api::ERR_TYPE_MISMATCH,
+                };
+                if let Err(e) = store::push_no_cli(id, entry.name, value) {
+                    return map_store_error(&e);
+                }
+            }
+            _ => {
+                let value = match deserialize_value(&kind, entry.value_bytes) {
+                    Some(v) => v,
+                    None => return oboos_api::ERR_TYPE_MISMATCH,
+                };
+                if entry.name == "status" && entry.value_bytes == b"exiting" {
+                    has_status_exiting = true;
+                }
+                scalar_updates.push((entry.name, value));
             }
         }
-        _ => {
-            let value = match deserialize_value(&kind, value_bytes) {
-                Some(v) => v,
-                None => return u64::MAX,
-            };
-            if store::set_no_cli(id, &[(field_name, value)]).is_err() {
-                return u64::MAX;
-            }
+    }
+
+    // Write all scalar fields atomically.
+    if !scalar_updates.is_empty() {
+        if let Err(e) = store::set_no_cli(id, &scalar_updates) {
+            return map_store_error(&e);
         }
     }
 
     // ── Side-effects ──────────────────────────────────────────────────
 
-    // Process exit: if userspace set status to "exiting" on its own
-    // process store, read the exit_code and trigger the exit path.
-    // This must be checked before poll_once() because it diverges.
-    let pid = process::current_pid();
-    if let Some(proc_store) = process::store_id(pid) {
-        if proc_store == id && field_name == "status" && value_bytes == b"exiting" {
-            let exit_code = match store::get_no_cli(id, "exit_code") {
-                Ok(Value::U64(v)) => v,
-                _ => 0,
-            };
-            process::exit(pid, exit_code);
-            unsafe { restore_return_context(); }
+    // Process exit: if this batch wrote status="exiting" on the process store.
+    if has_status_exiting {
+        let pid = process::current_pid();
+        if let Some(proc_store) = process::store_id(pid) {
+            if proc_store == id {
+                let exit_code = match store::get_no_cli(id, "exit_code") {
+                    Ok(Value::U64(v)) => v,
+                    _ => 0,
+                };
+                process::exit(pid, exit_code);
+                unsafe { restore_return_context(); }
+            }
         }
     }
 
@@ -676,6 +796,117 @@ fn handle_store_set(
     crate::arch::Arch::disable_interrupts();
 
     0
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// SYS_STORE_WATCH — blocking single-field watch
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Global flag set by the watch waker when the watched field is written.
+/// Since only one process runs at a time, a single flag suffices.
+static WATCH_FLAG: AtomicBool = AtomicBool::new(false);
+
+/// Custom [`RawWakerVTable`] for the watch flag waker. `wake()` sets
+/// [`WATCH_FLAG`] to true. Zero allocation, stable address.
+static WATCH_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    |data| RawWaker::new(data, &WATCH_WAKER_VTABLE), // clone
+    |_| WATCH_FLAG.store(true, Ordering::SeqCst),     // wake
+    |_| WATCH_FLAG.store(true, Ordering::SeqCst),     // wake_by_ref
+    |_| {},                                            // drop
+);
+
+/// Create a [`Waker`] that sets [`WATCH_FLAG`] on wake.
+fn watch_flag_waker() -> Waker {
+    let raw = RawWaker::new(core::ptr::null(), &WATCH_WAKER_VTABLE);
+    unsafe { Waker::from_raw(raw) }
+}
+
+/// Handle SYS_STORE_WATCH (syscall 2).
+///
+/// Blocks until the specified field is written (via `set` or `push`).
+/// Uses a busy-wait loop that calls [`poll_once()`] to keep async tasks
+/// running (e.g. the console driver) while waiting for the waker to fire.
+///
+/// For console `"input"` watches, also polls the keyboard buffer each
+/// iteration and pushes ASCII bytes into the console store.
+///
+/// Returns 0 on success, or a structured error code on failure.
+fn handle_store_watch(store_id_raw: u64, field_ptr: u64, field_len: u64) -> u64 {
+    if !validate_user_ptr(field_ptr, field_len) {
+        return oboos_api::ERR_INVALID_ARG;
+    }
+
+    let field_bytes = unsafe {
+        core::slice::from_raw_parts(field_ptr as *const u8, field_len as usize)
+    };
+    let field_name = match core::str::from_utf8(field_bytes) {
+        Ok(s) => s,
+        Err(_) => return oboos_api::ERR_INVALID_ARG,
+    };
+
+    let id = match resolve_store_id(store_id_raw) {
+        Some(id) => id,
+        None => return oboos_api::ERR_NOT_FOUND,
+    };
+
+    // Verify the field exists before subscribing.
+    if let Err(e) = store::field_kind_no_cli(id, field_name) {
+        return map_store_error(&e);
+    }
+
+    // Detect whether we're watching console input — if so, we'll poll
+    // the keyboard buffer each iteration of the wait loop.
+    let watching_console_input = {
+        let console_id = console_store_id();
+        console_id == Some(id) && field_name == "input"
+    };
+
+    WATCH_FLAG.store(false, Ordering::SeqCst);
+
+    // Subscribe with a flag-based waker.
+    let waker = watch_flag_waker();
+    if let Err(e) = store::subscribe_no_cli(id, field_name, waker) {
+        return map_store_error(&e);
+    }
+
+    // Busy-wait loop. Preemption is disabled so PIT ticks don't switch
+    // us to stale scheduler tasks, but poll_once() briefly enables
+    // interrupts to process async tasks.
+    crate::scheduler::disable_preemption();
+
+    loop {
+        // Process async tasks (console driver, etc.).
+        crate::executor::poll_once();
+
+        // If watching console input, drain scancodes from the keyboard
+        // buffer and push them as ASCII bytes into the console store.
+        if watching_console_input {
+            crate::arch::Arch::disable_interrupts();
+            while let Some(scancode) = super::keyboard::pop_scancode() {
+                if scancode & 0x80 != 0 { continue; } // skip break codes
+                if let Some(ascii) = super::keyboard::scancode_to_ascii(scancode) {
+                    let _ = store::push_no_cli(id, "input", Value::U8(ascii));
+                }
+            }
+            crate::arch::Arch::enable_interrupts();
+        }
+
+        if WATCH_FLAG.load(Ordering::SeqCst) { break; }
+
+        crate::arch::Arch::enable_interrupts();
+        crate::arch::Arch::halt_until_interrupt();
+    }
+
+    crate::scheduler::enable_preemption();
+
+    // Restore IF=0 for the sysretq path.
+    crate::arch::Arch::disable_interrupts();
+
+    // Check the store still exists (it may have been destroyed while waiting).
+    match store::field_kind_no_cli(id, field_name) {
+        Ok(_) => 0,
+        Err(_) => oboos_api::ERR_NOT_FOUND,
+    }
 }
 
 // ————————————————————————————————————————————————————————————————————————————

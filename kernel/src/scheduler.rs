@@ -32,7 +32,7 @@
 //!   out when its time slice expires.
 
 use alloc::collections::VecDeque;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::arch::{self, TaskContext};
 use crate::platform::{ContextSwitch, Platform};
@@ -47,6 +47,12 @@ const PREEMPT_TICKS: u32 = 10;
 /// [`on_tick()`] on every PIT interrupt. When it hits zero, the
 /// scheduler forces a context switch and resets the counter.
 static TICKS_REMAINING: AtomicU32 = AtomicU32::new(PREEMPT_TICKS);
+
+/// When true, [`on_tick()`] skips preemptive scheduling even when the
+/// time slice expires. Used by the SYS_STORE_WATCH busy-wait loop to
+/// prevent PIT ticks from preempting us into stale scheduler tasks while
+/// we're polling the executor inside a syscall.
+static PREEMPT_DISABLED: AtomicBool = AtomicBool::new(false);
 
 /// Global scheduler instance. Initialized once from `kmain` via [`init()`],
 /// then accessed by [`spawn()`], [`yield_now()`], and [`on_tick()`].
@@ -169,15 +175,33 @@ pub fn yield_now() {
     arch::Arch::enable_interrupts();
 }
 
+/// Suppress preemptive scheduling.
+///
+/// While disabled, [`on_tick()`] still counts ticks but never calls
+/// [`schedule()`]. Used by the SYS_STORE_WATCH wait loop which needs
+/// to call [`poll_once()`] (enabling interrupts briefly) without
+/// getting preempted into stale scheduler tasks.
+pub fn disable_preemption() {
+    PREEMPT_DISABLED.store(true, Ordering::SeqCst);
+}
+
+/// Re-enable preemptive scheduling after [`disable_preemption()`].
+pub fn enable_preemption() {
+    PREEMPT_DISABLED.store(false, Ordering::SeqCst);
+}
+
 /// Called from [`pit::tick()`](crate::arch::pit::tick) on every
 /// PIT interrupt (1 kHz = every ~1ms).
 ///
 /// Decrements the current task's remaining time slice. When it expires
-/// (hits zero), forces a context switch via [`schedule()`]. The
+/// (hits zero), forces a context switch via [`schedule()`] — unless
+/// preemption is disabled (e.g. during a WATCH wait loop). The
 /// interrupt gate guarantees IF=0, and `iretq` will restore the
 /// preempted task's RFLAGS (with IF=1) when it resumes.
 pub fn on_tick() {
     if TICKS_REMAINING.fetch_sub(1, Ordering::Relaxed) == 1 {
-        schedule();
+        if !PREEMPT_DISABLED.load(Ordering::SeqCst) {
+            schedule();
+        }
     }
 }

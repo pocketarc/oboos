@@ -42,6 +42,7 @@ pub trait Platform {
 pub enum Key {
     Enter,
     F,
+    H,
     T,
     /// A key we recognize but don't have a named variant for yet.
     /// Carries the raw scancode for callers that want to inspect it.
