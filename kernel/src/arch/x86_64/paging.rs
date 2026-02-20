@@ -326,4 +326,34 @@ pub fn unmap_page(virt: usize) {
 
     pt.entries[idx] = PageTableEntry::empty();
     invlpg(virt);
+
+    // Flush the TLB entry on all other cores.
+    super::smp::tlb_shootdown(virt);
+}
+
+/// Ensure a device MMIO physical address is mapped through the HHDM.
+///
+/// Limine's HHDM covers RAM regions from the memory map, but not necessarily
+/// MMIO regions like the Local APIC (`0xFEE00000`) or I/O APIC (`0xFEC00000`).
+/// This maps a single 4 KiB page at the HHDM virtual address corresponding
+/// to `phys`, with cache-disabled flags appropriate for device registers.
+///
+/// Safe to call multiple times — skips if the page is already mapped.
+pub fn ensure_mmio_mapped(phys: usize) {
+    let virt = phys_to_virt(phys as u64) as usize;
+
+    // Check if Limine already mapped this through the HHDM.
+    if let Some(pt) = walk_existing(virt) {
+        if pt.entries[pt_index(virt)].is_present() {
+            return;
+        }
+    }
+
+    // Map with PRESENT | WRITABLE | PWT (bit 3) | PCD (bit 4).
+    // PCD (Page Cache Disable) and PWT (Page Write-Through) are essential
+    // for MMIO — without them the CPU may cache device register reads and
+    // coalesce/reorder writes, producing stale data or lost updates.
+    let flags = PageTableEntry::PRESENT | PageTableEntry::WRITABLE | (1 << 3) | (1 << 4);
+    let pt = walk_or_create(virt);
+    pt.entries[pt_index(virt)] = PageTableEntry::new(phys as u64, flags);
 }

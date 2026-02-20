@@ -50,6 +50,14 @@ impl SerialConsole for Serial {
     }
 }
 
+/// Lock protecting serial output from interleaving across cores.
+///
+/// Without this, multiple CPUs printing simultaneously produce garbled
+/// output as their byte streams interleave mid-message. The lock is
+/// acquired by the [`print!`] macro for the entire format string, so
+/// complete messages are atomic.
+pub static SERIAL_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
 /// Implements [`core::fmt::Write`] so we can use `write!` / `writeln!`
 /// with the serial port. This is what makes our `print!` and `println!`
 /// macros work.

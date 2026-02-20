@@ -3,13 +3,16 @@
 pub mod context;
 pub mod gdt;
 pub mod interrupts;
+pub mod ioapic;
 pub mod keyboard;
+pub mod lapic;
 pub mod memory;
 pub mod paging;
 pub mod pic;
 pub mod pit;
 pub mod port;
 pub mod serial;
+pub mod smp;
 pub mod speaker;
 pub mod switch;
 pub mod syscall;
@@ -41,10 +44,21 @@ impl Platform for X86_64 {
         memory::init();
 
         // Program the PIT for 1 kHz, then register its tick handler.
-        // This order matters: configure the hardware before unmasking
-        // its IRQ, so we don't get an interrupt before we're ready.
+        // The PIT is needed first for APIC timer calibration, then its
+        // IRQ 0 handler drives the system tick until APIC mode takes over.
         pit::init(1000);
         interrupts::set_irq_handler(0, pit::tick);
+
+        // Initialize the Local APIC (per-core interrupt controller) and
+        // calibrate its timer against the PIT. Then set up the I/O APIC
+        // (external interrupt routing) which disables the 8259 PIC.
+        // After this, the APIC timer drives the system tick instead of PIT.
+        lapic::init();
+        ioapic::init();
+
+        // Set up BSP's PerCpu struct and GS base so current_cpu() works
+        // before smp::init() brings up APs. LAPIC ID is filled in later.
+        smp::init_bsp_percpu();
 
         X86_64
     }
@@ -81,7 +95,14 @@ impl Platform for X86_64 {
     }
 
     fn elapsed_ms() -> u64 {
-        pit::elapsed_ms()
+        // In APIC mode, use the global tick counter driven by the BSP's
+        // APIC timer handler. In PIC mode (before APIC init), fall back
+        // to the PIT-based counter.
+        if lapic::is_apic_mode() {
+            lapic::elapsed_ms()
+        } else {
+            pit::elapsed_ms()
+        }
     }
 
     /// Trigger a divide-by-zero exception (#DE, vector 0).

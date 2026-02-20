@@ -36,6 +36,9 @@ pub fn run_all() {
     test_multi_field_set();
     test_persistent_watcher();
     test_ring3();
+    test_smp_bringup();
+    test_cross_core_async();
+    test_executor_work_stealing();
     println!();
     println!("[ok] All smoke tests passed");
 }
@@ -1103,6 +1106,120 @@ fn test_persistent_watcher() {
 
     store::destroy(id).expect("cleanup persistent watcher store");
     println!("[ok] Persistent watcher verified (fires on every write, removable)");
+}
+
+/// Verify that SMP bringup brought at least 2 CPUs online.
+///
+/// This test is meaningful only when QEMU is launched with `-smp` > 1
+/// (which our Makefile does). If only 1 CPU is available (e.g., a
+/// non-SMP QEMU invocation), the test is skipped rather than failed.
+fn test_smp_bringup() {
+    let count = arch::smp::cpu_count();
+    if count < 2 {
+        println!("[skip] SMP bringup: only {} CPU(s) available", count);
+        return;
+    }
+    assert!(count >= 2, "expected at least 2 CPUs online, got {}", count);
+    println!("[ok] SMP bringup verified ({} CPUs online)", count);
+}
+
+/// Verify cross-core async execution via [`executor::spawn_on()`].
+///
+/// Spawns a future on CPU 1 that records which core it actually runs on.
+/// The BSP waits (with interrupts enabled) for the future to complete,
+/// then asserts it ran on CPU 1. This proves: spawn_on placed the future
+/// on CPU 1's executor, the IPI woke CPU 1, and CPU 1 polled the future.
+fn test_cross_core_async() {
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    let count = arch::smp::cpu_count();
+    if count < 2 {
+        println!("[skip] Cross-core async: only {} CPU(s) available", count);
+        return;
+    }
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static RAN_ON_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
+    DONE.store(false, Ordering::SeqCst);
+    RAN_ON_CPU.store(u32::MAX, Ordering::SeqCst);
+
+    executor::spawn_on(1, async {
+        RAN_ON_CPU.store(arch::smp::current_cpu(), Ordering::SeqCst);
+        DONE.store(true, Ordering::SeqCst);
+    });
+
+    // Wait for CPU 1 to poll and complete the future. Interrupts must
+    // be enabled so the BSP's timer ticks and CPU 1's executor runs.
+    arch::Arch::enable_interrupts();
+    let mut spins = 0u64;
+    while !DONE.load(Ordering::SeqCst) {
+        arch::Arch::halt_until_interrupt();
+        spins += 1;
+        if spins > 5000 {
+            panic!("test_cross_core_async: timed out waiting for CPU 1");
+        }
+    }
+    arch::Arch::disable_interrupts();
+
+    let cpu = RAN_ON_CPU.load(Ordering::SeqCst);
+    assert_eq!(cpu, 1, "expected future to run on CPU 1, ran on CPU {}", cpu);
+    println!("[ok] Cross-core async verified (future ran on CPU {})", cpu);
+}
+
+/// Verify executor work stealing: idle APs steal tasks from the BSP.
+///
+/// Spawns 16 immediately-completing futures on CPU 0 (BSP). The BSP
+/// does NOT poll them — it just waits with interrupts enabled. The APs'
+/// `run()` loops call `try_steal_and_poll()`, steal from the BSP's wake
+/// queue, and complete the futures. Asserts that at least 1 future ran
+/// on a non-BSP core.
+fn test_executor_work_stealing() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    let count = arch::smp::cpu_count();
+    if count < 2 {
+        println!("[skip] Work stealing: only {} CPU(s) available", count);
+        return;
+    }
+
+    // Enable work stealing for this test — APs can now steal from BSP.
+    executor::enable_work_stealing();
+
+    const N: usize = 16;
+    static COMPLETED: AtomicU32 = AtomicU32::new(0);
+    static NON_BSP_COUNT: AtomicU32 = AtomicU32::new(0);
+    COMPLETED.store(0, Ordering::SeqCst);
+    NON_BSP_COUNT.store(0, Ordering::SeqCst);
+
+    // Spawn all futures on CPU 0 (BSP). Each records which core ran it.
+    for _ in 0..N {
+        executor::spawn(async {
+            let cpu = arch::smp::current_cpu();
+            if cpu != 0 {
+                NON_BSP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+            COMPLETED.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+
+    // Enable interrupts and wait. BSP does NOT call poll_once() — we
+    // rely entirely on APs stealing from our wake queue.
+    arch::Arch::enable_interrupts();
+    let mut spins = 0u64;
+    while COMPLETED.load(Ordering::SeqCst) < N as u32 {
+        arch::Arch::halt_until_interrupt();
+        spins += 1;
+        if spins > 5000 {
+            let done = COMPLETED.load(Ordering::SeqCst);
+            panic!("test_executor_work_stealing: timed out ({}/{} completed)", done, N);
+        }
+    }
+    arch::Arch::disable_interrupts();
+
+    let stolen = NON_BSP_COUNT.load(Ordering::SeqCst);
+    let total = COMPLETED.load(Ordering::SeqCst);
+    assert!(stolen > 0, "expected at least 1 future stolen by an AP, got 0");
+    println!("[ok] Executor work stealing verified ({}/{} futures stolen by APs)", stolen, total);
 }
 
 /// Verify the Ring 3 store round trip: load an ELF, drop to user mode,

@@ -17,8 +17,9 @@ USERSPACE_ELF = $(USERSPACE_DIR)/target/x86_64-unknown-none/debug/oboos-hello
 USERSPACE_RUSTFLAGS = -Crelocation-model=static$(shell printf '\037')-Clink-arg=-Tlinker.ld
 
 QEMU_FLAGS = -cdrom $(ISO) -serial stdio -no-reboot -no-shutdown -m 128M \
+	-smp sockets=2,cores=4,threads=1 \
 	-audiodev coreaudio,id=audio0 -machine pcspk-audiodev=audio0
-TEST_TIMEOUT ?= 5
+TEST_TIMEOUT ?= 10
 
 all: iso
 

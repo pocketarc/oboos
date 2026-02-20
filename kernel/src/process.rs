@@ -19,9 +19,10 @@
 //!
 //! ## Concurrency
 //!
-//! Only one process runs at a time (single-core). [`CURRENT_PID`] is an
-//! `AtomicU64` set before entering Ring 3 and read by syscall handlers.
-//! This becomes per-CPU state when SMP arrives.
+//! The current PID is stored per-core in the [`PerCpu`](crate::arch::smp::PerCpu)
+//! struct, accessed via GS-relative addressing. Each core can run a process
+//! independently — [`current_pid()`] reads from the calling core's PerCpu,
+//! and [`set_current()`] / [`clear_current()`] write to it.
 //!
 //! ## Lock ordering
 //!
@@ -33,7 +34,6 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::store::{self, StoreId};
 use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
@@ -121,12 +121,9 @@ fn table() -> &'static spin::Mutex<ProcessTable> {
     PROCESS_TABLE.get().expect("process::init() not called")
 }
 
-/// The PID of the currently executing userspace process.
-///
-/// Set before entering Ring 3, read by syscall handlers. `u64::MAX` means
-/// no process is running (sentinel — PID 0 is never assigned either, since
-/// `next_pid` starts at 1, but MAX is unambiguous).
-static CURRENT_PID: AtomicU64 = AtomicU64::new(u64::MAX);
+// The PID of the currently executing userspace process is stored per-core
+// in the PerCpu struct (accessed via GS base). See `smp::current_pid()`
+// and `smp::set_current_pid()`. `u64::MAX` means no process is running.
 
 // ————————————————————————————————————————————————————————————————————————————
 // Public API
@@ -225,19 +222,19 @@ pub fn exit(pid: Pid, exit_code: u64) {
     ]).expect("update process store on exit");
 }
 
-/// Read the PID of the currently executing userspace process.
+/// Read the PID of the currently executing userspace process on this core.
 pub fn current_pid() -> Pid {
-    Pid(CURRENT_PID.load(Ordering::Relaxed))
+    Pid(crate::arch::smp::current_pid())
 }
 
-/// Set the current process PID before entering Ring 3.
+/// Set the current process PID on this core before entering Ring 3.
 pub fn set_current(pid: Pid) {
-    CURRENT_PID.store(pid.0, Ordering::Relaxed);
+    crate::arch::smp::set_current_pid(pid.0);
 }
 
-/// Clear the current process PID after returning from Ring 3.
+/// Clear the current process PID on this core after returning from Ring 3.
 pub fn clear_current() {
-    CURRENT_PID.store(u64::MAX, Ordering::Relaxed);
+    crate::arch::smp::set_current_pid(u64::MAX);
 }
 
 /// Look up the store ID backing a process's lifecycle store.

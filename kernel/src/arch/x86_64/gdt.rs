@@ -80,8 +80,12 @@ const TSS_SELECTOR: u16 = 0x28; // GDT index 5 — TSS descriptor (moved from 0x
 /// the right offset, hence `#[repr(C, packed)]`. The reserved fields exist
 /// because this struct evolved from the 32-bit TSS, which had fields for
 /// hardware task switching that are now vestigial.
+///
+/// `pub(crate)` because each AP needs its own TSS embedded in
+/// [`smp::PerCpu`](super::smp::PerCpu), and [`init_gdt_tss`] takes
+/// `&mut Tss` as a parameter.
 #[repr(C, packed)]
-struct Tss {
+pub(crate) struct Tss {
     /// Reserved (was "link to previous TSS" in 32-bit hardware task switching).
     _reserved0: u32,
 
@@ -133,7 +137,7 @@ struct Tss {
 /// of this array (address of element [4095] + 1).
 static mut DOUBLE_FAULT_STACK: [u8; 4096] = [0; 4096];
 
-/// The TSS instance. Filled in by `init()`.
+/// The TSS instance. Filled in by [`init_gdt_tss`].
 static mut TSS: Tss = Tss {
     _reserved0: 0,
     rsp: [0; 3],
@@ -183,158 +187,79 @@ struct GdtRegister {
 // Initialization
 // ————————————————————————————————————————————————————————————————————————————
 
-/// Set up and load the GDT + TSS.
+/// Initialize a GDT + TSS pair and load them into the current CPU core.
 ///
-/// After this function returns:
-/// - CS points to our 64-bit kernel code segment (selector 0x08)
-/// - DS/ES/SS point to our kernel data segment (selector 0x10)
-/// - User data (0x18) and user code (0x20) segments are ready for Ring 3
-/// - The CPU knows about our TSS (loaded via `ltr`, selector 0x28)
-/// - IST1 in the TSS points to a dedicated 4 KiB double-fault stack
+/// Performs the full sequence: zero and fill the TSS, build GDT segment
+/// descriptors, load the GDT register, reload CS via far return, reload
+/// data segment registers, and load the Task Register. Works on
+/// caller-provided storage so it can be used for both the BSP (with static
+/// GDT/TSS) and each AP (with per-CPU GDT/TSS from
+/// [`smp::PerCpu`](super::smp::PerCpu)).
 ///
-/// This must be called before setting up the IDT, because the
-/// double-fault IDT entry will reference IST1, which lives in the TSS.
-pub fn init() {
-    // Safety: we're in single-threaded kernel init, no other code is
-    // touching these statics yet. After init, the GDT and TSS are
-    // read-only from the CPU's perspective (it reads them, we don't
-    // write them again until we set RSP0 for user-mode tasks later).
+/// # Safety
+///
+/// - `gdt`, `tss`, and `df_stack` must remain valid for the lifetime of
+///   the CPU (typically `'static`).
+/// - Must be called with interrupts disabled.
+pub(crate) unsafe fn init_gdt_tss(gdt: &mut [u64; 7], tss: &mut Tss, df_stack: &[u8; 4096]) {
     unsafe {
+        // Zero the TSS — reserved fields and unused RSP/IST entries must
+        // be zero. The CPU reads these on interrupts and ring transitions,
+        // so stale values could cause hard-to-debug faults.
+        core::ptr::write_bytes(tss as *mut Tss as *mut u8, 0, size_of::<Tss>());
+
         // ── Step 1: Fill the TSS ──────────────────────────────────────
         //
         // Point IST[0] (= IST1 in Intel's 1-indexed naming) to the top
         // of our double-fault stack. "Top" = highest address, because
         // x86 stacks grow downward (push decrements RSP).
-        let stack_base = &raw const DOUBLE_FAULT_STACK as u64;
-        let stack_top = stack_base + size_of::<[u8; 4096]>() as u64;
-        (*(&raw mut TSS)).ist[0] = stack_top;
+        let stack_top = df_stack.as_ptr() as u64 + size_of::<[u8; 4096]>() as u64;
+        tss.ist[0] = stack_top;
 
         // "No I/O bitmap" — set the offset past the end of the TSS.
-        (*(&raw mut TSS)).iomap_base = size_of::<Tss>() as u16;
+        tss.iomap_base = size_of::<Tss>() as u16;
 
         // ── Step 2: Build the GDT entries ─────────────────────────────
         //
-        // Entry 0: Null descriptor (required by the CPU).
-        let gdt = &raw mut GDT;
-        (*gdt)[0] = 0;
+        // See the static GDT doc comment for the full entry layout.
+        // The magic constants encode present bits, DPL, type, and flags.
+        gdt[0] = 0;                         // Null descriptor (required)
+        gdt[1] = 0x00AF_9A00_0000_FFFF;     // Kernel code (DPL=0, L=1)
+        gdt[2] = 0x00CF_9200_0000_FFFF;     // Kernel data (DPL=0)
+        gdt[3] = 0x00CF_F200_0000_FFFF;     // User data   (DPL=3)
+        gdt[4] = 0x00AF_FA00_0000_FFFF;     // User code   (DPL=3, L=1)
 
-        // Entry 1: Kernel code segment (selector 0x08).
-        //
-        // Bit-by-bit breakdown of 0x00AF_9A00_0000_FFFF:
-        //
-        //   Limit[15:0]  = 0xFFFF   (ignored in 64-bit mode, but convention)
-        //   Base[15:0]   = 0x0000   (ignored in 64-bit mode)
-        //   Base[23:16]  = 0x00     (ignored in 64-bit mode)
-        //   Access byte  = 0x9A:
-        //     P  (Present)     = 1  — segment is valid
-        //     DPL              = 00 — ring 0 (kernel privilege)
-        //     S  (Descriptor)  = 1  — this is a code/data segment, not a system descriptor
-        //     Type             = 0xA (1010):
-        //       Code           = 1  — this is a code segment (executable)
-        //       Conforming     = 0  — don't allow lower-privilege code to call in
-        //       Readable       = 1  — code can also be read (needed for some instructions)
-        //       Accessed       = 0  — CPU sets this on first use, we leave it clear
-        //   Flags nibble = 0xA:
-        //     G  (Granularity) = 1  — limit is in 4 KiB pages (irrelevant in 64-bit)
-        //     D/B              = 0  — must be 0 when L=1
-        //     L  (Long mode)   = 1  — THIS IS THE BIT THAT KEEPS US IN 64-BIT MODE
-        //     AVL              = 0  — available for OS use, we don't use it
-        //   Limit[19:16] = 0xF     (ignored in 64-bit mode)
-        //   Base[31:24]  = 0x00    (ignored in 64-bit mode)
-        (*gdt)[1] = 0x00AF_9A00_0000_FFFF;
-
-        // Entry 2: Kernel data segment (selector 0x10).
-        //
-        // 0x00CF_9200_0000_FFFF:
-        //   Access byte = 0x92:
-        //     P=1, DPL=00, S=1, Type=0x2 (0010):
-        //       Code       = 0  — data segment (not executable)
-        //       Direction  = 0  — grows up (conventional)
-        //       Writable   = 1  — can write to data through this segment
-        //       Accessed   = 0
-        //   Flags nibble = 0xC:
-        //     G=1, D/B=1 (32-bit stack ops), L=0 (L only applies to code), AVL=0
-        (*gdt)[2] = 0x00CF_9200_0000_FFFF;
-
-        // Entry 3: User data segment (selector 0x18).
-        //
-        // 0x00CF_F200_0000_FFFF:
-        //   Access byte = 0xF2:
-        //     P=1, DPL=11 (ring 3), S=1, Type=0x2 (data, writable)
-        //   Flags nibble = 0xC:
-        //     G=1, D/B=1, L=0 (L only applies to code), AVL=0
-        //
-        // Must come before user code because SYSRET loads SS from
-        // STAR[63:48]+8 (this slot) and CS from STAR[63:48]+16 (next slot).
-        (*gdt)[3] = 0x00CF_F200_0000_FFFF;
-
-        // Entry 4: User code segment (selector 0x20).
-        //
-        // 0x00AF_FA00_0000_FFFF:
-        //   Access byte = 0xFA:
-        //     P=1, DPL=11 (ring 3), S=1, Type=0xA (code, readable)
-        //   Flags nibble = 0xA:
-        //     G=1, D/B=0, L=1 (64-bit mode!), AVL=0
-        //
-        // The L bit is what keeps user code in 64-bit long mode — same
-        // role as in the kernel code segment, just with DPL=3.
-        (*gdt)[4] = 0x00AF_FA00_0000_FFFF;
-
-        // Entries 5–6: TSS descriptor (16 bytes = two u64 slots).
-        //
-        // System descriptors (like TSS) are different from code/data descriptors.
-        // In 64-bit mode they're extended to 16 bytes so they can hold a full
-        // 64-bit base address. The layout is:
-        //
-        // Low 8 bytes (GDT[5]):
-        //   Bits  0–15:  Limit[15:0]       — TSS size minus 1
-        //   Bits 16–39:  Base[23:0]        — low 24 bits of TSS address
-        //   Bits 40–47:  Access byte       — 0x89 = Present, Type 0x9 (64-bit TSS, available)
-        //   Bits 48–51:  Limit[19:16]      — upper nibble of limit
-        //   Bits 52–55:  Flags             — 0 for system descriptors
-        //   Bits 56–63:  Base[31:24]       — next 8 bits of TSS address
-        //
-        // High 8 bytes (GDT[6]):
-        //   Bits  0–31:  Base[63:32]       — upper 32 bits of TSS address
-        //   Bits 32–63:  Reserved (must be zero)
-        let tss_addr = &raw const TSS as u64;
+        // Entries 5–6: TSS descriptor (16 bytes — two u64 slots).
+        // System descriptors need a full 64-bit base, so they span two GDT entries.
+        let tss_addr = tss as *const Tss as u64;
         let tss_limit = (size_of::<Tss>() - 1) as u64;
 
         let mut low: u64 = 0;
-        low |= tss_limit & 0xFFFF; // Limit[15:0]
-        low |= (tss_addr & 0x00FF_FFFF) << 16; // Base[23:0]
-        low |= 0x89 << 40; // Access: present, 64-bit TSS available
-        low |= ((tss_limit >> 16) & 0xF) << 48; // Limit[19:16]
-        low |= ((tss_addr >> 24) & 0xFF) << 56; // Base[31:24]
-        (*gdt)[5] = low;
+        low |= tss_limit & 0xFFFF;                    // Limit[15:0]
+        low |= (tss_addr & 0x00FF_FFFF) << 16;        // Base[23:0]
+        low |= 0x89 << 40;                            // Access: present, 64-bit TSS available
+        low |= ((tss_limit >> 16) & 0xF) << 48;       // Limit[19:16]
+        low |= ((tss_addr >> 24) & 0xFF) << 56;       // Base[31:24]
+        gdt[5] = low;
 
-        let high: u64 = tss_addr >> 32; // Base[63:32]
-        (*gdt)[6] = high;
+        gdt[6] = tss_addr >> 32;                      // Base[63:32]
 
         // ── Step 3: Load the GDT ─────────────────────────────────────
         //
         // `lgdt` takes a pointer to a 10-byte structure: 2-byte limit
         // (table size minus 1) followed by an 8-byte base address.
         let gdtr = GdtRegister {
-            limit: (size_of::<[u64; 7]>() - 1) as u16, // 55
-            base: &raw const GDT as u64,
+            limit: (size_of::<[u64; 7]>() - 1) as u16,
+            base: gdt.as_ptr() as u64,
         };
 
         core::arch::asm!("lgdt [{}]", in(reg) &gdtr, options(readonly, nostack, preserves_flags));
 
         // ── Step 4: Reload CS (code segment register) ────────────────
         //
-        // After loading a new GDT, CS still points at the OLD GDT's code
-        // segment entry. We need to reload it to reference our new one.
-        //
-        // Problem: you can't `mov cs, <value>` — the CPU forbids it.
-        // CS can only change via instructions that simultaneously update
-        // CS and RIP (instruction pointer): far jumps, far calls, far
-        // returns, or interrupts.
-        //
-        // The trick: push the new CS selector and a return address onto
-        // the stack, then execute `retfq` (far return). The CPU pops
-        // RIP and CS together, atomically switching to our new segment.
+        // After loading a new GDT, CS still references the old entry.
+        // Push the new selector + return address, then `retfq` (far return)
+        // to atomically update both CS and RIP.
         core::arch::asm!(
             "push {sel}",       // push new CS selector (0x08)
             "lea {tmp}, [rip + 2f]", // compute address of label '2'
@@ -348,11 +273,8 @@ pub fn init() {
 
         // ── Step 5: Reload data segment registers ────────────────────
         //
-        // DS, ES, and SS need to point to our kernel data segment.
-        // Unlike CS, these CAN be loaded with a regular `mov`.
-        // FS and GS are set to 0 (null) — we don't use them yet.
-        // (Later, FS/GS can be used for thread-local storage or
-        // per-CPU data.)
+        // DS, ES, SS point to kernel data. FS and GS are zeroed — GS
+        // base will be set to PerCpu via wrmsr(IA32_GS_BASE) during SMP init.
         core::arch::asm!(
             "mov ds, {sel:x}",
             "mov es, {sel:x}",
@@ -368,23 +290,47 @@ pub fn init() {
         //
         // `ltr` (Load Task Register) tells the CPU where the TSS is.
         // The operand is a GDT selector (0x28 = index 5), not an address.
-        // After this, the CPU can read IST entries from our TSS when
-        // handling interrupts.
         core::arch::asm!(
             "ltr {sel:x}",
             sel = in(reg) TSS_SELECTOR,
             options(nostack, preserves_flags),
         );
     }
+}
+
+/// Set up and load the GDT + TSS for the BSP (Bootstrap Processor).
+///
+/// Uses the module's static storage for the GDT, TSS, and double-fault
+/// stack. After this function returns:
+/// - CS points to our 64-bit kernel code segment (selector 0x08)
+/// - DS/ES/SS point to our kernel data segment (selector 0x10)
+/// - User data (0x18) and user code (0x20) segments are ready for Ring 3
+/// - The CPU knows about our TSS (loaded via `ltr`, selector 0x28)
+/// - IST1 in the TSS points to a dedicated 4 KiB double-fault stack
+///
+/// This must be called before setting up the IDT, because the
+/// double-fault IDT entry will reference IST1, which lives in the TSS.
+pub fn init() {
+    unsafe {
+        init_gdt_tss(
+            &mut *(&raw mut GDT),
+            &mut *(&raw mut TSS),
+            &*(&raw const DOUBLE_FAULT_STACK),
+        );
+    }
 
     crate::println!("[ok] GDT loaded with TSS");
 }
 
-/// Set the Ring 0 stack pointer in the TSS.
+/// Set the Ring 0 stack pointer in the current core's TSS.
 ///
 /// When the CPU transitions from Ring 3 to Ring 0 (via interrupt or
 /// exception — SYSCALL doesn't use the TSS), it loads RSP from TSS.RSP0.
 /// This must point to a valid kernel stack before entering user mode.
+///
+/// Writes to the per-CPU TSS embedded in [`PerCpu`](super::smp::PerCpu)
+/// via GS base. Both BSP and APs use per-CPU TSS storage (the BSP
+/// reloads its GDT/TSS from PerCpu during [`smp::init_bsp_percpu`]).
 ///
 /// # Safety
 ///
@@ -393,6 +339,11 @@ pub fn init() {
 /// remains valid for the entire duration of Ring 3 execution.
 pub unsafe fn set_rsp0(rsp0: u64) {
     unsafe {
-        (*(&raw mut TSS)).rsp[0] = rsp0;
+        // TSS is #[repr(C, packed)] — rsp[0] sits at offset 4 (after
+        // _reserved0: u32), which is NOT 8-byte aligned. Using
+        // write_unaligned avoids UB from creating an unaligned &mut u64.
+        let percpu = super::smp::current_percpu();
+        let rsp0_ptr = core::ptr::addr_of_mut!((*percpu).tss.rsp) as *mut u64;
+        rsp0_ptr.write_unaligned(rsp0);
     }
 }

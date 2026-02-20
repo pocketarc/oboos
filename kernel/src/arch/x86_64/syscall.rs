@@ -267,36 +267,27 @@ unsafe fn wrmsr(msr: u32, value: u64) {
 // ————————————————————————————————————————————————————————————————————————————
 // Syscall entry point state
 // ————————————————————————————————————————————————————————————————————————————
-
-/// Saved user RSP. SYSCALL doesn't touch RSP — it's our job to swap stacks.
-/// Written by `syscall_entry` before loading the kernel stack. Single-CPU
-/// with IF=0 on entry, so no races.
-static mut SAVED_USER_RSP: u64 = 0;
-
-/// Kernel stack pointer loaded by `syscall_entry`. Set by [`set_kernel_rsp`]
-/// before entering Ring 3.
-static mut KERNEL_RSP: u64 = 0;
-
-/// Saved kernel context for the process exit return path. When the user
-/// program triggers exit (by setting PROCESS/"status" to "exiting"), the
-/// handler restores these registers and RSP to return control to whoever
-/// called [`jump_to_ring3`].
-///
-/// Layout: `[rsp, rbx, rbp, r12, r13, r14, r15]` — same callee-saved
-/// register set as our context switch, stored via `mov` (not `push`) so
-/// we don't disturb RSP during the save.
-static mut RETURN_CONTEXT: [u64; 7] = [0; 7];
+//
+// Per-core syscall state (saved_user_rsp, kernel_rsp, return_context,
+// current_pid) lives in the PerCpu struct, accessed via GS-relative
+// addressing. See `smp::PerCpu` for field definitions and `smp::PERCPU_*`
+// for the byte offsets used in the assembly below.
+//
+// GS base always points to the current core's PerCpu — even in Ring 3.
+// Our user programs don't touch GS, so no SWAPGS is needed. If untrusted
+// userspace is added later (where a user could corrupt GS via `mov gs, 0`),
+// SWAPGS would need to be added to both the syscall and interrupt paths.
 
 // ————————————————————————————————————————————————————————————————————————————
 // Initialization
 // ————————————————————————————————————————————————————————————————————————————
 
-/// Configure the SYSCALL/SYSRET mechanism.
+/// Configure the SYSCALL/SYSRET MSRs on the current core.
 ///
-/// Sets up the four MSRs that control fast system calls. After this,
-/// executing `syscall` in Ring 3 will jump to [`syscall_entry`] with
-/// kernel CS/SS loaded and interrupts disabled (IF cleared by FMASK).
-pub fn init() {
+/// These MSRs are per-CPU registers — each core must configure them
+/// independently. Called by [`init()`] for the BSP and by
+/// [`smp::ap_entry`](super::smp) for each AP.
+pub(crate) fn init_syscall_msrs() {
     unsafe {
         // Enable SYSCALL/SYSRET by setting the SCE bit in EFER.
         // EFER also controls NXE (no-execute) and LME (long mode enable),
@@ -328,7 +319,15 @@ pub fn init() {
         // could fire and push a frame onto the wrong stack.
         wrmsr(IA32_FMASK, 0x200);
     }
+}
 
+/// Configure the SYSCALL/SYSRET mechanism on the BSP.
+///
+/// Sets up the four MSRs that control fast system calls. After this,
+/// executing `syscall` in Ring 3 will jump to [`syscall_entry`] with
+/// kernel CS/SS loaded and interrupts disabled (IF cleared by FMASK).
+pub fn init() {
+    init_syscall_msrs();
     crate::println!("[ok] SYSCALL/SYSRET configured");
 }
 
@@ -393,10 +392,11 @@ fn validate_user_ptr(ptr: u64, len: u64) -> bool {
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry() {
     naked_asm!(
-        // Save user RSP and load kernel RSP. These two instructions run
-        // with IF=0, so no interrupt can fire between them.
-        "mov [{saved_user_rsp}], rsp",
-        "mov rsp, [{kernel_rsp}]",
+        // Save user RSP and load kernel RSP from the current core's PerCpu
+        // via GS-relative addressing. These two instructions run with IF=0,
+        // so no interrupt can fire between them.
+        "mov gs:[{saved_user_rsp}], rsp",
+        "mov rsp, gs:[{kernel_rsp}]",
 
         // Save user return state on the kernel stack.
         "push rcx",          // user RIP (SYSCALL saved it in RCX)
@@ -426,11 +426,11 @@ unsafe extern "C" fn syscall_entry() {
         "pop rcx",           // user RIP → RCX for SYSRET
 
         // Restore user RSP and return to Ring 3.
-        "mov rsp, [{saved_user_rsp}]",
+        "mov rsp, gs:[{saved_user_rsp}]",
         "sysretq",
 
-        saved_user_rsp = sym SAVED_USER_RSP,
-        kernel_rsp = sym KERNEL_RSP,
+        saved_user_rsp = const super::smp::PERCPU_SAVED_USER_RSP,
+        kernel_rsp = const super::smp::PERCPU_KERNEL_RSP,
         handler = sym syscall_handler,
     );
 }
@@ -970,15 +970,15 @@ pub async fn keyboard_input_driver() {
 unsafe fn restore_return_context() -> ! {
     unsafe {
         core::arch::asm!(
-            "mov r15, [{ctx} + 48]",
-            "mov r14, [{ctx} + 40]",
-            "mov r13, [{ctx} + 32]",
-            "mov r12, [{ctx} + 24]",
-            "mov rbp, [{ctx} + 16]",
-            "mov rbx, [{ctx} + 8]",
-            "mov rsp, [{ctx} + 0]",
+            "mov r15, gs:[{ctx} + 48]",
+            "mov r14, gs:[{ctx} + 40]",
+            "mov r13, gs:[{ctx} + 32]",
+            "mov r12, gs:[{ctx} + 24]",
+            "mov rbp, gs:[{ctx} + 16]",
+            "mov rbx, gs:[{ctx} + 8]",
+            "mov rsp, gs:[{ctx} + 0]",
             "ret",
-            ctx = sym RETURN_CONTEXT,
+            ctx = const super::smp::PERCPU_RETURN_CONTEXT,
             options(noreturn),
         );
     }
@@ -988,13 +988,14 @@ unsafe fn restore_return_context() -> ! {
 // Ring 3 entry
 // ————————————————————————————————————————————————————————————————————————————
 
-/// Set the kernel RSP used by [`syscall_entry`].
+/// Set the kernel RSP used by [`syscall_entry`] on the current core.
 ///
 /// Must be called before entering Ring 3. The syscall entry stub loads
-/// this value into RSP immediately after saving the user RSP.
+/// this value into RSP (via `gs:[kernel_rsp]`) immediately after saving
+/// the user RSP.
 pub fn set_kernel_rsp(rsp: u64) {
     unsafe {
-        KERNEL_RSP = rsp;
+        (*super::smp::current_percpu()).kernel_rsp = rsp;
     }
 }
 
@@ -1037,16 +1038,17 @@ pub fn set_kernel_rsp(rsp: u64) {
 #[unsafe(naked)]
 pub unsafe extern "C" fn jump_to_ring3(_rip: u64, _rsp: u64, _arg0: u64) {
     naked_asm!(
-        // Save callee-saved registers and RSP into RETURN_CONTEXT.
-        // Using `mov` (not `push`) so we don't modify RSP during the save.
+        // Save callee-saved registers and RSP into the current core's
+        // PerCpu return_context via GS-relative addressing. Using `mov`
+        // (not `push`) so we don't modify RSP during the save.
         // RSP currently points to the return address pushed by `call`.
-        "mov [{ctx} + 0], rsp",
-        "mov [{ctx} + 8], rbx",
-        "mov [{ctx} + 16], rbp",
-        "mov [{ctx} + 24], r12",
-        "mov [{ctx} + 32], r13",
-        "mov [{ctx} + 40], r14",
-        "mov [{ctx} + 48], r15",
+        "mov gs:[{ctx} + 0], rsp",
+        "mov gs:[{ctx} + 8], rbx",
+        "mov gs:[{ctx} + 16], rbp",
+        "mov gs:[{ctx} + 24], r12",
+        "mov gs:[{ctx} + 32], r13",
+        "mov gs:[{ctx} + 40], r14",
+        "mov gs:[{ctx} + 48], r15",
 
         // Build iretq frame. RDI = user RIP, RSI = user RSP, RDX = arg0.
         "push 0x1B",         // SS: user data selector (0x18 | RPL=3)
@@ -1062,6 +1064,6 @@ pub unsafe extern "C" fn jump_to_ring3(_rip: u64, _rsp: u64, _arg0: u64) {
 
         "iretq",
 
-        ctx = sym RETURN_CONTEXT,
+        ctx = const super::smp::PERCPU_RETURN_CONTEXT,
     );
 }

@@ -37,7 +37,7 @@ use store::StoreId;
 // pointers before jumping to our entry point. It's a clever handshake that
 // avoids needing any runtime negotiation.
 
-use limine::request::{FramebufferRequest, RequestsEndMarker, RequestsStartMarker};
+ use limine::request::{FramebufferRequest, MpRequest, RequestsEndMarker, RequestsStartMarker};
 use limine::BaseRevision;
 
 #[used]
@@ -53,6 +53,10 @@ static BASE_REVISION: BaseRevision = BaseRevision::with_revision(3);
 static FRAMEBUFFER: FramebufferRequest = FramebufferRequest::new();
 
 #[used]
+#[unsafe(link_section = ".requests")]
+static MP_REQUEST: MpRequest = MpRequest::new();
+
+#[used]
 #[unsafe(link_section = ".requests_end_marker")]
 static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
@@ -64,6 +68,7 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 macro_rules! print {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
+        let _guard = crate::arch::serial::SERIAL_LOCK.lock();
         let _ = write!(crate::arch::Serial, $($arg)*);
     }};
 }
@@ -143,6 +148,12 @@ extern "C" fn kmain() -> ! {
     // Initialize the async executor — polls futures from kmain's main loop.
     executor::init();
 
+    // Bring up additional CPU cores. APs initialize their own GDT/TSS,
+    // load the shared IDT, and park in hlt. Later phases give them work.
+    if let Some(mp_response) = MP_REQUEST.get_response() {
+        arch::smp::init(mp_response);
+    }
+
     // Run smoke tests when built with `--features smoke-test` (via `make test`).
     #[cfg(feature = "smoke-test")]
     tests::run_all();
@@ -195,12 +206,20 @@ extern "C" fn kmain() -> ! {
             // Spawn async tasks, enable interrupts, and hand control to
             // the executor. The keyboard task is IRQ-driven via scancodes;
             // the blink task is PIT-driven via timer::sleep().
-            executor::spawn(sysmon_updater(sysmon_id));
+            // Run the updater on CPU 1 when available — exercises the full
+            // cross-core IPC path: timer::sleep on CPU 1, store::set wakes
+            // the renderer on CPU 0 via IPI, proving end-to-end SMP async.
+            if arch::smp::cpu_count() > 1 {
+                executor::spawn_on(1, sysmon_updater(sysmon_id));
+            } else {
+                executor::spawn(sysmon_updater(sysmon_id));
+            }
             executor::spawn(sysmon_renderer(sysmon_id, app_id));
             executor::spawn(keyboard_task(app_id));
             executor::spawn(display_task(app_id));
             executor::spawn(blink_task());
             executor::spawn(boot_chime());
+            executor::enable_work_stealing();
             arch::Arch::enable_interrupts();
             println!("[ok] Hardware interrupts enabled");
             executor::run(); // never returns

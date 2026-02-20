@@ -39,7 +39,7 @@
 //! Invalid TSS (10), Segment Not Present (11), Stack Segment Fault (12),
 //! General Protection Fault (13), Page Fault (14), Alignment Check (17).
 
-use super::{gdt, pic};
+use super::{gdt, lapic, pic};
 use core::mem::size_of;
 
 // ————————————————————————————————————————————————————————————————————————————
@@ -213,7 +213,14 @@ pub fn set_irq_handler(irq: u8, handler: fn()) {
 macro_rules! irq_handler {
     ($name:ident, $irq:expr) => {
         extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
-            pic::acknowledge($irq);
+            // In APIC mode, the I/O APIC delivers interrupts and the Local
+            // APIC expects EOI. In PIC mode, the 8259 PIC handles delivery
+            // and EOI. We check once per IRQ which mode is active.
+            if lapic::is_apic_mode() {
+                lapic::eoi();
+            } else {
+                pic::acknowledge($irq);
+            }
             unsafe {
                 if let Some(handler) = IRQ_HANDLERS[$irq] {
                     handler();
@@ -248,6 +255,61 @@ const IRQ_STUBS: [extern "x86-interrupt" fn(InterruptStackFrame); 16] = [
     irq_handler_8,  irq_handler_9,  irq_handler_10, irq_handler_11,
     irq_handler_12, irq_handler_13, irq_handler_14, irq_handler_15,
 ];
+
+// ————————————————————————————————————————————————————————————————————————————
+// APIC interrupt handlers
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Vector 48: APIC timer interrupt.
+///
+/// Each core's Local APIC timer fires at 1 kHz. The BSP increments the
+/// global tick counter (for `elapsed_ms()`), and all cores call the
+/// scheduler's `on_tick()` for per-core preemption and `check_deadlines()`
+/// for async sleep wakeups.
+extern "x86-interrupt" fn apic_timer_handler(_frame: InterruptStackFrame) {
+    lapic::eoi();
+
+    // Only the BSP increments the global tick counter for elapsed_ms().
+    if lapic::id() == 0 {
+        lapic::GLOBAL_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Every core drives its own scheduler (per-core preemption) and
+    // checks timer deadlines. Each core has its own tick counter and
+    // ready queue.
+    crate::scheduler::on_tick();
+    crate::timer::check_deadlines();
+}
+
+/// Vector 49: IPI wake — breaks an AP out of `hlt` (Phase 4).
+///
+/// The handler is intentionally empty — the interrupt itself is the signal.
+/// Sending EOI is still required so the LAPIC can deliver the next interrupt.
+extern "x86-interrupt" fn ipi_wake_handler(_frame: InterruptStackFrame) {
+    lapic::eoi();
+}
+
+/// Vector 50: TLB shootdown — invalidate a page on this core.
+///
+/// Called via IPI from [`smp::tlb_shootdown()`](super::smp::tlb_shootdown)
+/// after another core unmaps a page. Reads the target virtual address from
+/// shared state, executes `invlpg`, and decrements the pending counter so
+/// the initiating core knows when all TLBs have been flushed.
+extern "x86-interrupt" fn tlb_shootdown_handler(_frame: InterruptStackFrame) {
+    crate::arch::smp::handle_tlb_shootdown();
+    lapic::eoi();
+}
+
+/// Vector 0xFF: Spurious interrupt.
+///
+/// The LAPIC generates spurious interrupts when an interrupt is deasserted
+/// before the CPU acknowledges it (race condition in hardware). The correct
+/// response is to do absolutely nothing — specifically, do NOT send EOI.
+/// Sending EOI for a spurious interrupt would confuse the LAPIC's priority
+/// tracking.
+extern "x86-interrupt" fn spurious_handler(_frame: InterruptStackFrame) {
+    // Intentionally empty. No EOI.
+}
 
 // ————————————————————————————————————————————————————————————————————————————
 // Exception handlers
@@ -400,6 +462,22 @@ extern "x86-interrupt" fn page_fault_handler(
 // Initialization
 // ————————————————————————————————————————————————————————————————————————————
 
+/// Load the IDT register, pointing the CPU at the shared IDT.
+///
+/// Called by [`init()`] after building the IDT entries, and by APs during
+/// SMP bringup. The IDT is shared across all cores — only the GDT/TSS
+/// are per-CPU.
+pub(crate) fn load_idt() {
+    unsafe {
+        let idtr = IdtRegister {
+            limit: (size_of::<[IdtEntry; 256]>() - 1) as u16,
+            base: &raw const IDT as u64,
+        };
+
+        core::arch::asm!("lidt [{}]", in(reg) &idtr, options(readonly, nostack, preserves_flags));
+    }
+}
+
 /// Set up the IDT with exception handlers and load it.
 ///
 /// After this function returns, CPU exceptions produce readable panic
@@ -432,19 +510,31 @@ pub fn init() {
         // Vectors 32–47: Hardware IRQ handlers (one per PIC line).
         // These are registered now but won't fire until the PIC is
         // initialized and individual IRQs are unmasked by device drivers.
+        // In APIC mode, these same vectors are reused for I/O APIC-routed IRQs.
         for i in 0..16u8 {
             let vector = (pic::IRQ_BASE + i) as usize;
             (*idt)[vector] = IdtEntry::new(IRQ_STUBS[i as usize] as *const () as u64, 0);
         }
 
-        // Load the IDT register — same pattern as lgdt in gdt.rs.
-        let idtr = IdtRegister {
-            limit: (size_of::<[IdtEntry; 256]>() - 1) as u16,
-            base: &raw const IDT as u64,
-        };
+        // Vector 48: APIC timer — each core's Local APIC periodic interrupt.
+        (*idt)[lapic::TIMER_VECTOR as usize] =
+            IdtEntry::new(apic_timer_handler as *const () as u64, 0);
 
-        core::arch::asm!("lidt [{}]", in(reg) &idtr, options(readonly, nostack, preserves_flags));
+        // Vector 49: IPI wake — breaks APs out of hlt (Phase 4).
+        (*idt)[lapic::IPI_WAKE_VECTOR as usize] =
+            IdtEntry::new(ipi_wake_handler as *const () as u64, 0);
+
+        // Vector 50: TLB shootdown — remote TLB invalidation (Phase 5).
+        (*idt)[lapic::TLB_SHOOTDOWN_VECTOR as usize] =
+            IdtEntry::new(tlb_shootdown_handler as *const () as u64, 0);
+
+        // Vector 0xFF: Spurious — LAPIC generates these on interrupt races.
+        // Must NOT send EOI.
+        (*idt)[0xFF] =
+            IdtEntry::new(spurious_handler as *const () as u64, 0);
     }
+
+    load_idt();
 
     crate::println!("[ok] IDT loaded (6 exception handlers, 16 IRQ vectors)");
 

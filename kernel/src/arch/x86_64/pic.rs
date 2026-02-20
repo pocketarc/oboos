@@ -165,6 +165,19 @@ pub fn acknowledge(irq: u8) {
     }
 }
 
+/// Disable the 8259 PIC entirely by masking all IRQs.
+///
+/// Called during the transition to APIC mode. After this, no interrupts
+/// will be delivered through the PIC. The PIC hardware remains initialized
+/// (it was needed for APIC timer calibration via the PIT), but all 16
+/// IRQ lines are masked.
+pub fn disable() {
+    unsafe {
+        outb(MASTER_DATA, 0xFF);
+        outb(SLAVE_DATA, 0xFF);
+    }
+}
+
 /// Brief I/O delay to give the PIC time to process a command.
 ///
 /// Port 0x80 is the "POST diagnostic" port — writing to it does nothing
