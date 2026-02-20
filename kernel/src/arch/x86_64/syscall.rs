@@ -697,9 +697,7 @@ fn handle_store_get(
             FieldKind::Queue(_) => {
                 match store::pop_no_cli(id, field_name) {
                     Ok(Some(value)) => {
-                        // Serialize value into a temp buffer to get its length.
-                        // Keep this small — we're on the 4 KiB syscall kernel stack.
-                        let mut tmp = [0u8; 1024];
+                        let mut tmp = [0u8; 4096];
                         let val_len = match serialize_value(&value, &mut tmp) {
                             Some(n) => n,
                             None => return oboos_api::ERR_INVALID_ARG,
@@ -729,8 +727,7 @@ fn handle_store_get(
                     Ok(v) => v,
                     Err(e) => return map_store_error(&e),
                 };
-                // Keep this small — we're on the 4 KiB syscall kernel stack.
-                let mut tmp = [0u8; 1024];
+                let mut tmp = [0u8; 4096];
                 let val_len = match serialize_value(&value, &mut tmp) {
                     Some(n) => n,
                     None => return oboos_api::ERR_INVALID_ARG,

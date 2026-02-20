@@ -12,8 +12,8 @@
 //!
 //! ```text
 //! 0x0040_0000+  ELF segments  (PRESENT | USER, permissions from ELF flags)
-//! 0x0080_0000   User stack    (PRESENT | WRITABLE | USER | NO_EXECUTE)
-//! kernel-space  Syscall kernel stack (PRESENT | WRITABLE, no USER)
+//! 0x0080_0000           User stack    (PRESENT | WRITABLE | USER | NO_EXECUTE)
+//! 0xFFFF_FD00_...       Syscall kernel stack — 16 KiB + guard page (PRESENT | WRITABLE | NO_EXECUTE)
 //! ```
 //!
 //! ## Why a separate syscall kernel stack?
@@ -26,10 +26,12 @@
 //! This same stack also serves as TSS.RSP0 — used by the CPU when an
 //! interrupt (like the PIT) fires while in Ring 3.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::arch;
 use crate::elf;
 use crate::executor;
-use crate::memory;
+use crate::memory::{self, FRAME_SIZE};
 use crate::platform::{MemoryManager, PageFlags};
 use crate::platform::Platform;
 
@@ -37,6 +39,77 @@ use crate::println;
 use crate::process;
 use crate::store;
 use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+// ————————————————————————————————————————————————————————————————————————————
+// Syscall kernel stack allocator
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Base virtual address for syscall kernel stacks. Sits below task stacks
+/// (`0xFFFF_FE00_0000_0000`) with 1 TiB of gap between them.
+const KERN_STACK_REGION_BASE: usize = 0xFFFF_FD00_0000_0000;
+
+/// Number of 4 KiB pages per syscall kernel stack (16 KiB total).
+/// Matches task stack size, and gives comfortable room for serialization
+/// buffers, nested calls, and interrupt frames that can arrive via TSS.RSP0.
+const KERN_STACK_PAGES: usize = 4;
+
+/// Pages per slot: 1 guard page + [`KERN_STACK_PAGES`] mapped pages.
+const KERN_SLOT_PAGES: usize = KERN_STACK_PAGES + 1;
+
+/// Bump counter for syscall kernel stack slots.
+static NEXT_KERN_SLOT: AtomicU64 = AtomicU64::new(0);
+
+/// Tracks the physical frames and virtual address range of a syscall kernel
+/// stack, so the caller can free it when the process exits.
+struct KernelStackAlloc {
+    /// Virtual address of the first mapped page (just above the guard page).
+    stack_bottom: usize,
+    /// Virtual address one past the last mapped byte — the initial RSP
+    /// (x86 stacks grow downward).
+    stack_top: usize,
+    /// Physical frames backing the stack pages.
+    frames: [usize; KERN_STACK_PAGES],
+}
+
+/// Allocate a 16 KiB syscall kernel stack with a guard page below.
+///
+/// Same layout as task stacks in [`task.rs`]: bump-allocate a virtual slot,
+/// leave page 0 unmapped (guard), map pages 1–4 with PRESENT | WRITABLE |
+/// NO_EXECUTE (no USER — this is a kernel-only stack). All mapped pages are
+/// zeroed.
+fn alloc_kernel_stack() -> KernelStackAlloc {
+    let slot = NEXT_KERN_SLOT.fetch_add(1, Ordering::Relaxed) as usize;
+    let slot_base = KERN_STACK_REGION_BASE + slot * KERN_SLOT_PAGES * FRAME_SIZE;
+    let stack_bottom = slot_base + FRAME_SIZE; // skip guard page
+    let stack_top = slot_base + KERN_SLOT_PAGES * FRAME_SIZE;
+
+    let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
+    let mut frames = [0usize; KERN_STACK_PAGES];
+
+    for i in 0..KERN_STACK_PAGES {
+        let frame = memory::alloc_frame().expect("out of memory allocating syscall kernel stack");
+        let virt = stack_bottom + i * FRAME_SIZE;
+        arch::Arch::map_page(virt, frame, flags);
+        frames[i] = frame;
+    }
+
+    // Zero all stack pages through the virtual mapping.
+    unsafe {
+        core::ptr::write_bytes(stack_bottom as *mut u8, 0, KERN_STACK_PAGES * FRAME_SIZE);
+    }
+
+    KernelStackAlloc { stack_bottom, stack_top, frames }
+}
+
+/// Unmap and free a syscall kernel stack previously allocated by
+/// [`alloc_kernel_stack`].
+fn free_kernel_stack(alloc: KernelStackAlloc) {
+    for i in 0..KERN_STACK_PAGES {
+        let virt = alloc.stack_bottom + i * FRAME_SIZE;
+        arch::Arch::unmap_page(virt);
+        memory::free_frame(alloc.frames[i]);
+    }
+}
 
 /// The userspace ELF binary, compiled separately and embedded at build time.
 /// The Makefile ensures this is built before the kernel.
@@ -87,9 +160,8 @@ pub fn run_ring3_smoke_test() {
     let user_rsp = (USER_STACK_VIRT + memory::FRAME_SIZE) as u64;
 
     // ── Step 4: Allocate the syscall kernel stack ──────────────────
-    let kern_stack_frame = memory::alloc_frame().expect("alloc syscall kernel stack");
-    let kern_stack_top = arch::memory::phys_to_virt(kern_stack_frame as u64);
-    let kern_stack_rsp = kern_stack_top as u64 + memory::FRAME_SIZE as u64;
+    let kern_stack = alloc_kernel_stack();
+    let kern_stack_rsp = kern_stack.stack_top as u64;
 
     arch::syscall::set_kernel_rsp(kern_stack_rsp);
     unsafe {
@@ -169,7 +241,7 @@ pub fn run_ring3_smoke_test() {
 
     arch::Arch::unmap_page(USER_STACK_VIRT);
     memory::free_frame(stack_frame);
-    memory::free_frame(kern_stack_frame);
+    free_kernel_stack(kern_stack);
 }
 
 /// Launch the hello program interactively from the splash screen.
@@ -194,9 +266,8 @@ pub fn run_hello_interactive() {
     );
     let user_rsp = (USER_STACK_VIRT + memory::FRAME_SIZE) as u64;
 
-    let kern_stack_frame = memory::alloc_frame().expect("alloc syscall kernel stack");
-    let kern_stack_top = arch::memory::phys_to_virt(kern_stack_frame as u64);
-    let kern_stack_rsp = kern_stack_top as u64 + memory::FRAME_SIZE as u64;
+    let kern_stack = alloc_kernel_stack();
+    let kern_stack_rsp = kern_stack.stack_top as u64;
 
     arch::syscall::set_kernel_rsp(kern_stack_rsp);
     unsafe { arch::gdt::set_rsp0(kern_stack_rsp); }
@@ -239,5 +310,5 @@ pub fn run_hello_interactive() {
 
     arch::Arch::unmap_page(USER_STACK_VIRT);
     memory::free_frame(stack_frame);
-    memory::free_frame(kern_stack_frame);
+    free_kernel_stack(kern_stack);
 }
