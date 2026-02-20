@@ -19,6 +19,8 @@ pub mod error;
 pub mod process;
 pub mod schema;
 #[cfg(feature = "alloc")]
+pub mod store_value;
+#[cfg(feature = "alloc")]
 pub mod value;
 
 pub use error::{
@@ -28,5 +30,7 @@ pub use error::{
 #[cfg(feature = "alloc")]
 pub use process::ProcessSpec;
 pub use schema::{FieldDef, FieldKind, StoreSchema};
+#[cfg(feature = "alloc")]
+pub use store_value::StoreValue;
 #[cfg(feature = "alloc")]
 pub use value::Value;

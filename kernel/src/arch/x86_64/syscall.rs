@@ -515,7 +515,35 @@ fn deserialize_value(kind: &FieldKind, bytes: &[u8]) -> Option<Value> {
             if bytes.len() != 1 { return None; }
             Some(Value::U8(bytes[0]))
         }
-        FieldKind::Queue(_) => None,
+        FieldKind::Queue(_) | FieldKind::List(_) => None,
+        // Record deserialization: parse packed fields, look up each field's
+        // kind from the schema, recursively deserialize.
+        FieldKind::Record(field_defs) => {
+            let mut map = alloc::collections::BTreeMap::new();
+            let mut off = 0;
+            while off < bytes.len() {
+                if off + 2 > bytes.len() { return None; }
+                let name_len = u16::from_le_bytes([bytes[off], bytes[off + 1]]) as usize;
+                off += 2;
+                if off + name_len > bytes.len() { return None; }
+                let name = core::str::from_utf8(&bytes[off..off + name_len]).ok()?;
+                off += name_len;
+
+                if off + 2 > bytes.len() { return None; }
+                let val_len = u16::from_le_bytes([bytes[off], bytes[off + 1]]) as usize;
+                off += 2;
+                if off + val_len > bytes.len() { return None; }
+                let val_bytes = &bytes[off..off + val_len];
+                off += val_len;
+
+                let field_kind = field_defs.iter()
+                    .find(|f| f.name == name)
+                    .map(|f| &f.kind)?;
+                let value = deserialize_value(field_kind, val_bytes)?;
+                map.insert(String::from(name), value);
+            }
+            Some(Value::Record(map))
+        }
     }
 }
 
@@ -557,6 +585,52 @@ fn serialize_value(value: &Value, out_buf: &mut [u8]) -> Option<usize> {
             Some(1)
         }
         Value::Queue(_) => None,
+        // Record serialization: [u32 field_count] [u16 name_len, name, u16 val_len, val] ...
+        // Same packed format as the top-level SET buffer, applied recursively.
+        // Serializes elements directly into out_buf at an offset to avoid
+        // large temp buffers on the 4 KiB syscall kernel stack.
+        Value::Record(map) => {
+            if out_buf.len() < 4 { return None; }
+            let count = map.len() as u32;
+            out_buf[..4].copy_from_slice(&count.to_le_bytes());
+            let mut pos = 4;
+            for (name, val) in map {
+                let name_bytes = name.as_bytes();
+                if pos + 2 + name_bytes.len() + 2 > out_buf.len() { return None; }
+                out_buf[pos..pos + 2].copy_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+                pos += 2;
+                out_buf[pos..pos + name_bytes.len()].copy_from_slice(name_bytes);
+                pos += name_bytes.len();
+
+                // Reserve 2 bytes for length prefix, serialize value after it,
+                // then backfill the length.
+                let len_pos = pos;
+                pos += 2;
+                let val_len = serialize_value(val, &mut out_buf[pos..])?;
+                out_buf[len_pos..len_pos + 2].copy_from_slice(&(val_len as u16).to_le_bytes());
+                pos += val_len;
+            }
+            Some(pos)
+        }
+        // List serialization: [u32 count] [u16 elem_len, elem_bytes] ...
+        // Same direct-into-output-buffer pattern as Record.
+        Value::List(items) => {
+            if out_buf.len() < 4 { return None; }
+            let count = items.len() as u32;
+            out_buf[..4].copy_from_slice(&count.to_le_bytes());
+            let mut pos = 4;
+            for item in items {
+                if pos + 2 > out_buf.len() { return None; }
+                // Reserve 2 bytes for length prefix, serialize element after it,
+                // then backfill the length.
+                let len_pos = pos;
+                pos += 2;
+                let elem_len = serialize_value(item, &mut out_buf[pos..])?;
+                out_buf[len_pos..len_pos + 2].copy_from_slice(&(elem_len as u16).to_le_bytes());
+                pos += elem_len;
+            }
+            Some(pos)
+        }
     }
 }
 
@@ -624,6 +698,7 @@ fn handle_store_get(
                 match store::pop_no_cli(id, field_name) {
                     Ok(Some(value)) => {
                         // Serialize value into a temp buffer to get its length.
+                        // Keep this small — we're on the 4 KiB syscall kernel stack.
                         let mut tmp = [0u8; 1024];
                         let val_len = match serialize_value(&value, &mut tmp) {
                             Some(n) => n,
@@ -654,6 +729,7 @@ fn handle_store_get(
                     Ok(v) => v,
                     Err(e) => return map_store_error(&e),
                 };
+                // Keep this small — we're on the 4 KiB syscall kernel stack.
                 let mut tmp = [0u8; 1024];
                 let val_len = match serialize_value(&value, &mut tmp) {
                     Some(n) => n,
@@ -746,7 +822,7 @@ fn handle_store_set(
         };
 
         match kind {
-            FieldKind::Queue(inner) => {
+            FieldKind::Queue(inner) | FieldKind::List(inner) => {
                 let value = match deserialize_value(inner, entry.value_bytes) {
                     Some(v) => v,
                     None => return oboos_api::ERR_TYPE_MISMATCH,

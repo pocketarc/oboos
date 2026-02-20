@@ -30,6 +30,13 @@ pub fn run_all() {
     test_store_subscribe();
     test_store_queue();
     test_store_queue_watch();
+    test_store_list();
+    test_store_list_watch();
+    test_store_record();
+    test_store_list_of_records();
+    test_store_value_trait();
+    test_typed_store_handle();
+    test_typed_store_integration();
     test_process_lifecycle();
     test_process_store_watch();
     test_error_codes();
@@ -821,6 +828,450 @@ fn test_store_queue_watch() {
 
     store::destroy(id).expect("cleanup queue watch store");
     println!("[ok] Store queue watch verified (push wakes subscriber)");
+}
+
+/// Verify List field operations: push accumulates, get returns full list, type validation.
+///
+/// Unlike Queue (consumed on read), List elements persist across reads. GET
+/// returns the full list every time, and push appends without consuming.
+fn test_store_list() {
+    use alloc::vec;
+    use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+    struct ListSchema;
+    impl StoreSchema for ListSchema {
+        fn name() -> &'static str { "ListTest" }
+        fn fields() -> &'static [FieldDef] {
+            &[FieldDef { name: "items", kind: FieldKind::List(&FieldKind::U32) }]
+        }
+    }
+
+    let id = store::create::<ListSchema>(&[
+        ("items", Value::List(alloc::vec::Vec::new())),
+    ]).expect("create list store");
+
+    // GET on empty list returns empty Vec.
+    assert_eq!(store::get(id, "items").unwrap(), Value::List(vec![]));
+
+    // Push 3 elements.
+    store::push(id, "items", Value::U32(10)).expect("push 10");
+    store::push(id, "items", Value::U32(20)).expect("push 20");
+    store::push(id, "items", Value::U32(30)).expect("push 30");
+
+    // GET returns the full list (not consumed).
+    let expected = Value::List(vec![Value::U32(10), Value::U32(20), Value::U32(30)]);
+    assert_eq!(store::get(id, "items").unwrap(), expected);
+
+    // GET again — still returns the full list (retained, not drained).
+    assert_eq!(store::get(id, "items").unwrap(), expected);
+
+    // set() can replace the entire list.
+    let new_list = Value::List(vec![Value::U32(99)]);
+    store::set(id, &[("items", new_list.clone())]).expect("replace list");
+    assert_eq!(store::get(id, "items").unwrap(), new_list);
+
+    // Type mismatch: push a Str into a List(U32).
+    assert!(store::push(id, "items", Value::Str(alloc::string::String::from("bad"))).is_err());
+
+    // Pop/drain are Queue-only — should fail on List.
+    assert!(store::pop(id, "items").is_err());
+    assert!(store::drain(id, "items").is_err());
+
+    store::destroy(id).expect("cleanup list store");
+    println!("[ok] Store list operations verified (push, get retains, set replaces, type validation)");
+}
+
+/// Verify that push on a List field wakes subscribers, just like set() on scalars.
+fn test_store_list_watch() {
+    use alloc::vec;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+    struct ListWatchSchema;
+    impl StoreSchema for ListWatchSchema {
+        fn name() -> &'static str { "ListWatch" }
+        fn fields() -> &'static [FieldDef] {
+            &[FieldDef { name: "items", kind: FieldKind::List(&FieldKind::U32) }]
+        }
+    }
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static SAW_LIST: AtomicBool = AtomicBool::new(false);
+    DONE.store(false, Ordering::SeqCst);
+    SAW_LIST.store(false, Ordering::SeqCst);
+
+    let id = store::create::<ListWatchSchema>(&[
+        ("items", Value::List(alloc::vec::Vec::new())),
+    ]).expect("create list watch store");
+
+    executor::spawn(async move {
+        if store::watch(id, &["items"]).await.is_err() {
+            panic!("list watch failed");
+        }
+        match store::get(id, "items") {
+            Ok(Value::List(items)) if items == vec![Value::U32(42)] => {
+                SAW_LIST.store(true, Ordering::SeqCst);
+            }
+            other => panic!("unexpected list get result: {:?}", other),
+        }
+        DONE.store(true, Ordering::SeqCst);
+    });
+
+    // First poll: subscribes, returns Pending.
+    executor::poll_once();
+    assert!(!DONE.load(Ordering::SeqCst));
+
+    // Push a value — wakes the subscriber.
+    store::push(id, "items", Value::U32(42)).expect("push to list");
+
+    // Second poll: reads the list and completes.
+    let completed = executor::poll_once();
+    assert!(DONE.load(Ordering::SeqCst));
+    assert!(SAW_LIST.load(Ordering::SeqCst));
+    assert_eq!(completed, 1);
+
+    store::destroy(id).expect("cleanup list watch store");
+    println!("[ok] Store list watch verified (push wakes subscriber)");
+}
+
+/// Verify Record field operations: set, get, validation.
+///
+/// Records are structured values with named, typed fields — like a Rust struct
+/// stored as a BTreeMap. Validation is strict: exactly the declared fields,
+/// no more, no less, each matching its declared kind.
+fn test_store_record() {
+    use alloc::collections::BTreeMap;
+    use alloc::string::String;
+    use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+    static POINT_FIELDS: &[FieldDef] = &[
+        FieldDef { name: "x", kind: FieldKind::U32 },
+        FieldDef { name: "y", kind: FieldKind::U32 },
+    ];
+
+    static RECORD_SCHEMA_FIELDS: &[FieldDef] = &[
+        FieldDef { name: "point", kind: FieldKind::Record(POINT_FIELDS) },
+    ];
+
+    struct RecordSchema;
+    impl StoreSchema for RecordSchema {
+        fn name() -> &'static str { "RecordTest" }
+        fn fields() -> &'static [FieldDef] { RECORD_SCHEMA_FIELDS }
+    }
+
+    // Helper to build a Point record.
+    fn point(x: u32, y: u32) -> Value {
+        let mut map = BTreeMap::new();
+        map.insert(String::from("x"), Value::U32(x));
+        map.insert(String::from("y"), Value::U32(y));
+        Value::Record(map)
+    }
+
+    let id = store::create::<RecordSchema>(&[
+        ("point", point(0, 0)),
+    ]).expect("create record store");
+
+    // Read default back.
+    assert_eq!(store::get(id, "point").unwrap(), point(0, 0));
+
+    // Set a new record value.
+    store::set(id, &[("point", point(10, 20))]).expect("set point");
+    assert_eq!(store::get(id, "point").unwrap(), point(10, 20));
+
+    // Validation: wrong number of fields (missing "y").
+    let mut bad_missing = BTreeMap::new();
+    bad_missing.insert(String::from("x"), Value::U32(1));
+    assert!(store::set(id, &[("point", Value::Record(bad_missing))]).is_err());
+
+    // Validation: extra field.
+    let mut bad_extra = BTreeMap::new();
+    bad_extra.insert(String::from("x"), Value::U32(1));
+    bad_extra.insert(String::from("y"), Value::U32(2));
+    bad_extra.insert(String::from("z"), Value::U32(3));
+    assert!(store::set(id, &[("point", Value::Record(bad_extra))]).is_err());
+
+    // Validation: wrong type for a field.
+    let mut bad_type = BTreeMap::new();
+    bad_type.insert(String::from("x"), Value::U32(1));
+    bad_type.insert(String::from("y"), Value::Bool(true));
+    assert!(store::set(id, &[("point", Value::Record(bad_type))]).is_err());
+
+    // Valid operations still work after errors.
+    store::set(id, &[("point", point(99, 88))]).expect("valid set after error");
+    assert_eq!(store::get(id, "point").unwrap(), point(99, 88));
+
+    store::destroy(id).expect("cleanup record store");
+    println!("[ok] Store record operations verified (set, get, strict validation)");
+}
+
+/// Verify List(Record(...)) — a list of structured values.
+///
+/// This is the primary use case: a retained collection of structured elements,
+/// like a scene graph of draw commands or a routing table.
+fn test_store_list_of_records() {
+    use alloc::collections::BTreeMap;
+    use alloc::string::String;
+    use alloc::vec;
+    use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+    static CMD_FIELDS: &[FieldDef] = &[
+        FieldDef { name: "x", kind: FieldKind::U32 },
+        FieldDef { name: "y", kind: FieldKind::U32 },
+        FieldDef { name: "label", kind: FieldKind::Str },
+    ];
+
+    static DRAW_LIST_INNER: FieldKind = FieldKind::Record(CMD_FIELDS);
+    static DRAW_LIST_SCHEMA_FIELDS: &[FieldDef] = &[
+        FieldDef { name: "commands", kind: FieldKind::List(&DRAW_LIST_INNER) },
+    ];
+
+    struct DrawListSchema;
+    impl StoreSchema for DrawListSchema {
+        fn name() -> &'static str { "DrawList" }
+        fn fields() -> &'static [FieldDef] { DRAW_LIST_SCHEMA_FIELDS }
+    }
+
+    fn cmd(x: u32, y: u32, label: &str) -> Value {
+        let mut map = BTreeMap::new();
+        map.insert(String::from("x"), Value::U32(x));
+        map.insert(String::from("y"), Value::U32(y));
+        map.insert(String::from("label"), Value::Str(String::from(label)));
+        Value::Record(map)
+    }
+
+    let id = store::create::<DrawListSchema>(&[
+        ("commands", Value::List(alloc::vec::Vec::new())),
+    ]).expect("create draw list store");
+
+    // Push records into the list.
+    store::push(id, "commands", cmd(10, 20, "hello")).expect("push cmd 1");
+    store::push(id, "commands", cmd(30, 40, "world")).expect("push cmd 2");
+
+    // GET returns the full list of records.
+    let expected = Value::List(vec![cmd(10, 20, "hello"), cmd(30, 40, "world")]);
+    assert_eq!(store::get(id, "commands").unwrap(), expected);
+
+    // Type mismatch: push a scalar into a List(Record).
+    assert!(store::push(id, "commands", Value::U32(42)).is_err());
+
+    store::destroy(id).expect("cleanup draw list store");
+    println!("[ok] Store list-of-records verified (push, get, type validation)");
+}
+
+/// Verify the StoreValue trait: scalar round-trips and Vec helpers.
+///
+/// Tests that each scalar type converts correctly to/from Value, and that
+/// the vec_into_list / list_into_vec helpers work for collections.
+fn test_store_value_trait() {
+    use alloc::string::String;
+    use alloc::vec;
+    use oboos_api::{FieldKind, StoreValue, Value};
+    use oboos_api::store_value::{vec_into_list, list_into_vec};
+
+    // Scalar round-trips.
+    assert_eq!(bool::field_kind(), FieldKind::Bool);
+    assert_eq!(true.into_value(), Value::Bool(true));
+    assert_eq!(bool::from_value(&Value::Bool(false)), Some(false));
+    assert_eq!(bool::from_value(&Value::U32(0)), None);
+
+    assert_eq!(u8::field_kind(), FieldKind::U8);
+    assert_eq!(42u8.into_value(), Value::U8(42));
+    assert_eq!(u8::from_value(&Value::U8(7)), Some(7));
+
+    assert_eq!(u32::field_kind(), FieldKind::U32);
+    assert_eq!(123u32.into_value(), Value::U32(123));
+    assert_eq!(u32::from_value(&Value::U32(999)), Some(999));
+
+    assert_eq!(u64::field_kind(), FieldKind::U64);
+    assert_eq!(1_000_000u64.into_value(), Value::U64(1_000_000));
+    assert_eq!(u64::from_value(&Value::U64(42)), Some(42));
+
+    assert_eq!(i64::field_kind(), FieldKind::I64);
+    assert_eq!((-5i64).into_value(), Value::I64(-5));
+    assert_eq!(i64::from_value(&Value::I64(-99)), Some(-99));
+
+    assert_eq!(String::field_kind(), FieldKind::Str);
+    assert_eq!(String::from("hello").into_value(), Value::Str(String::from("hello")));
+    assert_eq!(String::from_value(&Value::Str(String::from("world"))), Some(String::from("world")));
+
+    // Vec helpers.
+    let list_val = vec_into_list(vec![10u32, 20, 30]);
+    assert_eq!(list_val, Value::List(vec![Value::U32(10), Value::U32(20), Value::U32(30)]));
+
+    let back: Option<alloc::vec::Vec<u32>> = list_into_vec(&list_val);
+    assert_eq!(back, Some(vec![10u32, 20, 30]));
+
+    // Type mismatch in list_into_vec.
+    let bad_list = Value::List(vec![Value::U32(1), Value::Bool(true)]);
+    assert_eq!(list_into_vec::<u32>(&bad_list), None);
+
+    // Not a list at all.
+    assert_eq!(list_into_vec::<u32>(&Value::U32(42)), None);
+
+    println!("[ok] StoreValue trait verified (scalar round-trips, Vec helpers)");
+}
+
+/// Verify the typed Store<S> handle: create, get, set, push, pop, list.
+///
+/// Exercises the full typed API — concrete Rust types instead of raw Value
+/// enums. Proves the StoreValue round-trip works end-to-end through the
+/// store registry.
+fn test_typed_store_handle() {
+    use alloc::collections::VecDeque;
+    use alloc::string::String;
+    use crate::store_handle::Store;
+    use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+    struct TypedSchema;
+    impl StoreSchema for TypedSchema {
+        fn name() -> &'static str { "TypedTest" }
+        fn fields() -> &'static [FieldDef] {
+            &[
+                FieldDef { name: "count", kind: FieldKind::U32 },
+                FieldDef { name: "label", kind: FieldKind::Str },
+                FieldDef { name: "msgs", kind: FieldKind::Queue(&FieldKind::Str) },
+            ]
+        }
+    }
+
+    let s = Store::<TypedSchema>::create(&[
+        ("count", Value::U32(0)),
+        ("label", Value::Str(String::from("init"))),
+        ("msgs", Value::Queue(VecDeque::new())),
+    ]).expect("create typed store");
+
+    // Typed get/set for scalars.
+    assert_eq!(s.get::<u32>("count").unwrap(), 0);
+    s.set("count", 42u32).expect("typed set count");
+    assert_eq!(s.get::<u32>("count").unwrap(), 42);
+
+    assert_eq!(s.get::<String>("label").unwrap(), "init");
+    s.set("label", String::from("updated")).expect("typed set label");
+    assert_eq!(s.get::<String>("label").unwrap(), "updated");
+
+    // Typed push/pop for Queue.
+    s.push("msgs", String::from("hello")).expect("typed push");
+    s.push("msgs", String::from("world")).expect("typed push");
+    assert_eq!(s.pop::<String>("msgs").unwrap(), Some(String::from("hello")));
+    assert_eq!(s.pop::<String>("msgs").unwrap(), Some(String::from("world")));
+    assert_eq!(s.pop::<String>("msgs").unwrap(), None);
+
+    s.destroy().expect("destroy typed store");
+    println!("[ok] Typed Store<S> handle verified (create, get, set, push, pop)");
+}
+
+/// End-to-end integration test: List(Record) with typed Store<S> and watchers.
+///
+/// Defines a schema with List(Record(...)), creates a typed handle, pushes
+/// structured values, gets them back as typed Rust structs, and verifies
+/// watchers fire. This exercises all four layers (List, Record, StoreValue,
+/// typed handle) together.
+fn test_typed_store_integration() {
+    use alloc::collections::BTreeMap;
+    use alloc::string::String;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use crate::store_handle::Store;
+    use oboos_api::{FieldDef, FieldKind, StoreSchema, StoreValue, Value};
+
+    // A draw command: position + label. Manual StoreValue impl for Record.
+    #[derive(Debug, PartialEq)]
+    struct DrawCmd {
+        x: u32,
+        y: u32,
+        label: String,
+    }
+
+    impl StoreValue for DrawCmd {
+        fn field_kind() -> FieldKind {
+            FieldKind::Record(CMD_DEFS)
+        }
+
+        fn into_value(self) -> Value {
+            let mut map = BTreeMap::new();
+            map.insert(String::from("x"), Value::U32(self.x));
+            map.insert(String::from("y"), Value::U32(self.y));
+            map.insert(String::from("label"), Value::Str(self.label));
+            Value::Record(map)
+        }
+
+        fn from_value(value: &Value) -> Option<Self> {
+            match value {
+                Value::Record(map) => {
+                    let x = u32::from_value(map.get("x")?)?;
+                    let y = u32::from_value(map.get("y")?)?;
+                    let label = String::from_value(map.get("label")?)?;
+                    Some(DrawCmd { x, y, label })
+                }
+                _ => None,
+            }
+        }
+    }
+
+    static CMD_DEFS: &[FieldDef] = &[
+        FieldDef { name: "x", kind: FieldKind::U32 },
+        FieldDef { name: "y", kind: FieldKind::U32 },
+        FieldDef { name: "label", kind: FieldKind::Str },
+    ];
+
+    static INNER_KIND: FieldKind = FieldKind::Record(CMD_DEFS);
+    static INTEGRATION_FIELDS: &[FieldDef] = &[
+        FieldDef { name: "commands", kind: FieldKind::List(&INNER_KIND) },
+    ];
+
+    struct IntegrationSchema;
+    impl StoreSchema for IntegrationSchema {
+        fn name() -> &'static str { "Integration" }
+        fn fields() -> &'static [FieldDef] { INTEGRATION_FIELDS }
+    }
+
+    let s = Store::<IntegrationSchema>::create(&[
+        ("commands", Value::List(alloc::vec::Vec::new())),
+    ]).expect("create integration store");
+
+    // Push typed records.
+    s.push("commands", DrawCmd { x: 10, y: 20, label: String::from("hello") })
+        .expect("push cmd 1");
+    s.push("commands", DrawCmd { x: 30, y: 40, label: String::from("world") })
+        .expect("push cmd 2");
+
+    // Get typed list back.
+    let cmds: Vec<DrawCmd> = s.list::<DrawCmd>("commands").expect("list commands");
+    assert_eq!(cmds.len(), 2);
+    assert_eq!(cmds[0], DrawCmd { x: 10, y: 20, label: String::from("hello") });
+    assert_eq!(cmds[1], DrawCmd { x: 30, y: 40, label: String::from("world") });
+
+    // Verify watcher fires on push.
+    static WATCH_DONE: AtomicBool = AtomicBool::new(false);
+    WATCH_DONE.store(false, Ordering::SeqCst);
+
+    let store_id = s.id();
+    executor::spawn(async move {
+        if store::watch(store_id, &["commands"]).await.is_err() {
+            panic!("integration watch failed");
+        }
+        WATCH_DONE.store(true, Ordering::SeqCst);
+    });
+
+    // First poll: subscribes.
+    executor::poll_once();
+    assert!(!WATCH_DONE.load(Ordering::SeqCst));
+
+    // Push another command — wakes the watcher.
+    s.push("commands", DrawCmd { x: 50, y: 60, label: String::from("!") })
+        .expect("push cmd 3");
+
+    // Second poll: watcher completes.
+    executor::poll_once();
+    assert!(WATCH_DONE.load(Ordering::SeqCst));
+
+    // Final check: list now has 3 commands.
+    let cmds: Vec<DrawCmd> = s.list::<DrawCmd>("commands").expect("list after push");
+    assert_eq!(cmds.len(), 3);
+
+    s.destroy().expect("destroy integration store");
+    println!("[ok] Typed store integration verified (List(Record), StoreValue, watcher)");
 }
 
 /// Verify the process table and process store lifecycle without touching Ring 3.

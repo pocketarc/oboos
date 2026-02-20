@@ -36,6 +36,7 @@ pub trait StoreSchema {
 }
 
 /// A single field definition: a name and its expected type.
+#[derive(Debug, Clone, PartialEq)]
 pub struct FieldDef {
     pub name: &'static str,
     pub kind: FieldKind,
@@ -43,10 +44,13 @@ pub struct FieldDef {
 
 /// The type of a store field.
 ///
-/// Scalar variants are flat values. `Queue` is the first collection type:
-/// a FIFO queue parameterized by its element kind. SET on a Queue field
-/// pushes one element; GET pops one. No new syscalls needed — the store
-/// schema drives the behavior.
+/// Scalar variants are flat values. Collection types are parameterized by
+/// their element kind:
+///
+/// - `Queue` — consumed on read (FIFO). SET pushes, GET pops.
+/// - `List` — retained on read (ordered). SET pushes, GET returns full list.
+///
+/// No new syscalls needed — the store schema drives the behavior.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldKind {
     Bool,
@@ -60,4 +64,14 @@ pub enum FieldKind {
     /// The `&'static` reference works because schemas are always defined
     /// as static data (`fn fields() -> &'static [FieldDef]`).
     Queue(&'static FieldKind),
+    /// A retained ordered collection whose elements must match the inner
+    /// [`FieldKind`]. Unlike Queue, elements persist across reads — GET
+    /// returns the full list, not a single element.
+    List(&'static FieldKind),
+    /// A structured value with named, typed fields — like a struct.
+    ///
+    /// Reuses [`FieldDef`] directly, so a Record's fields are defined
+    /// the same way as a store's fields. Supports nesting:
+    /// `List(&FieldKind::Record(&[...]))` is a list of records.
+    Record(&'static [FieldDef]),
 }

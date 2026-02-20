@@ -19,6 +19,7 @@ mod process;
 mod platform;
 mod scheduler;
 mod store;
+pub mod store_handle;
 mod task;
 mod timer;
 mod userspace;

@@ -432,7 +432,7 @@ fn push_inner(store: StoreId, field: &str, value: Value) -> Result<(), StoreErro
             .ok_or(StoreError::UnknownField)?;
 
         let inner_kind = match &field_def.kind {
-            FieldKind::Queue(inner) => *inner,
+            FieldKind::Queue(inner) | FieldKind::List(inner) => *inner,
             _ => return Err(StoreError::TypeMismatch),
         };
 
@@ -440,9 +440,10 @@ fn push_inner(store: StoreId, field: &str, value: Value) -> Result<(), StoreErro
             return Err(StoreError::TypeMismatch);
         }
 
-        // Append to the queue.
+        // Append to the collection — Queue uses push_back, List uses push.
         match instance.data.get_mut(field) {
             Some(Value::Queue(deque)) => deque.push_back(value),
+            Some(Value::List(vec)) => vec.push(value),
             _ => return Err(StoreError::TypeMismatch),
         }
 
@@ -589,10 +590,13 @@ pub(crate) fn add_watcher_no_cli(
     // Use the schema's &'static str so the watcher's lifetime is sound.
     let static_name: &'static str = field_def.name;
 
-    // Check if the field is a non-empty queue — caller should fire
+    // Check if the field is a non-empty collection — caller should fire
     // immediately so userspace doesn't miss already-buffered data.
-    let fire_immediately = matches!(&field_def.kind, FieldKind::Queue(_))
-        && matches!(instance.data.get(field), Some(Value::Queue(q)) if !q.is_empty());
+    let fire_immediately = match &field_def.kind {
+        FieldKind::Queue(_) => matches!(instance.data.get(field), Some(Value::Queue(q)) if !q.is_empty()),
+        FieldKind::List(_) => matches!(instance.data.get(field), Some(Value::List(v)) if !v.is_empty()),
+        _ => false,
+    };
 
     instance.watchers.push(PersistentWatcher {
         field: static_name,
