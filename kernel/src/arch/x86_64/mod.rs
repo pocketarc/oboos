@@ -7,6 +7,7 @@ pub mod ioapic;
 pub mod keyboard;
 pub mod lapic;
 pub mod memory;
+mod msr;
 pub mod paging;
 pub mod pic;
 pub mod pit;

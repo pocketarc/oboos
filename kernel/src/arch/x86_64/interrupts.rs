@@ -89,22 +89,19 @@ impl IdtEntry {
         _reserved: 0,
     };
 
+    /// Present (bit 7) | DPL 0 (bits 5–6) | interrupt gate type 0xE (bits 0–3).
+    const PRESENT_RING0_INTERRUPT: u8 = 0x8E;
+
     /// Build a present interrupt gate entry.
     ///
     /// - `handler`: the function address (will be split across three fields)
     /// - `ist`: IST index (0 for normal stack, 1 for double-fault stack)
-    ///
-    /// The type_attr byte is 0x8E:
-    ///   bit 7     = 1 (Present)
-    ///   bits 5–6  = 00 (DPL 0 — only kernel can trigger via `int` instruction)
-    ///   bit 4     = 0 (system segment)
-    ///   bits 0–3  = 0xE (interrupt gate — clears IF on entry)
     fn new(handler: u64, ist: u8) -> Self {
         Self {
             handler_low: handler as u16,
             selector: gdt::KERNEL_CODE_SELECTOR,
             ist,
-            type_attr: 0x8E, // present, ring 0, interrupt gate
+            type_attr: Self::PRESENT_RING0_INTERRUPT,
             handler_mid: (handler >> 16) as u16,
             handler_high: (handler >> 32) as u32,
             _reserved: 0,

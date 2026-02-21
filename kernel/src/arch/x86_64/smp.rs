@@ -200,6 +200,16 @@ pub fn set_current_pid(pid: u64) {
 /// Only meaningful when `cpu_count() > 1`. Safe to call from
 /// non-interrupt context (IF can be either 0 or 1 — the sender doesn't
 /// need to receive interrupts, only remote cores do).
+///
+/// # Concurrent shootdown safety
+///
+/// This function uses a single global `TLB_SHOOTDOWN_ADDR` /
+/// `TLB_SHOOTDOWN_PENDING` pair, so concurrent shootdowns from
+/// multiple cores would race. This is currently safe because all
+/// callers hold the process table lock or run from a single kernel
+/// context (page fault handler with IF=0). If concurrent unmap/remap
+/// from multiple cores is ever needed, this will need a per-shootdown
+/// spinlock or a per-core request queue.
 pub fn tlb_shootdown(virt: usize) {
     let count = cpu_count();
     if count <= 1 {

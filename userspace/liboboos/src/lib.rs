@@ -58,16 +58,9 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 pub use oboos_api::{StoreError, is_error, ERR_THRESHOLD};
 
-// ————————————————————————————————————————————————————————————————————————————
-// Syscall numbers — must match kernel/src/arch/x86_64/syscall.rs
-// ————————————————————————————————————————————————————————————————————————————
-
-pub const SYS_STORE_GET: u64 = 0;
-pub const SYS_STORE_SET: u64 = 1;
-pub const SYS_SUBSCRIBE: u64 = 2;
-pub const SYS_UNSUBSCRIBE: u64 = 3;
-pub const SYS_YIELD: u64 = 4;
-pub const SYS_STORE_MUTATE: u64 = 5;
+pub use oboos_api::{
+    SYS_STORE_GET, SYS_STORE_SET, SYS_SUBSCRIBE, SYS_UNSUBSCRIBE, SYS_YIELD, SYS_STORE_MUTATE,
+};
 
 // ————————————————————————————————————————————————————————————————————————————
 // Well-known store IDs

@@ -114,7 +114,6 @@ struct PersistentWatcher {
 /// A live store instance: schema metadata + current field values + subscribers.
 struct StoreInstance {
     fields: &'static [FieldDef],
-    #[allow(dead_code)]
     schema_name: &'static str,
     data: BTreeMap<String, Value>,
     subscribers: Vec<Subscriber>,
@@ -122,6 +121,14 @@ struct StoreInstance {
     /// Type-erased reducer for handling MUTATE syscalls. `None` if this store
     /// doesn't support mutations (most don't — only process stores do for now).
     reducer: Option<ReducerVtable>,
+}
+
+impl StoreInstance {
+    /// The schema name this store was created from (e.g. "Process", "Console").
+    /// Used in debug/error messages.
+    pub(crate) fn name(&self) -> &'static str {
+        self.schema_name
+    }
 }
 
 // ————————————————————————————————————————————————————————————————————————————
@@ -278,6 +285,17 @@ pub fn init() {
         })
     });
     crate::println!("[ok] Store registry initialized");
+}
+
+/// Look up a store's schema name by ID (e.g. "Process", "Console").
+///
+/// Returns `None` if the store doesn't exist. Useful for debug/error
+/// messages without needing to hold the registry lock for long.
+pub(crate) fn name(store: StoreId) -> Option<&'static str> {
+    Arch::disable_interrupts();
+    let result = registry().lock().stores.get(&store.0).map(|s| s.name());
+    Arch::enable_interrupts();
+    result
 }
 
 /// Create a new store instance from a schema with the given default values.
@@ -651,12 +669,6 @@ pub fn drain(store: StoreId, field: &str) -> Result<Vec<Value>, StoreError> {
     result
 }
 
-/// Drain without touching the interrupt flag (syscall path).
-#[allow(dead_code)]
-pub(crate) fn drain_no_cli(store: StoreId, field: &str) -> Result<Vec<Value>, StoreError> {
-    drain_inner(store, field)
-}
-
 fn drain_inner(store: StoreId, field: &str) -> Result<Vec<Value>, StoreError> {
     let mut reg = registry().lock();
     let instance = reg.stores.get_mut(&store.0).ok_or(StoreError::NotFound)?;
@@ -769,6 +781,11 @@ pub(crate) fn remove_watcher_no_cli(
 ///
 /// If the store is destroyed while watching, the future resolves with
 /// [`StoreError::NotFound`].
+///
+/// The `&'static [&'static str]` parameter is a deliberate zero-allocation
+/// design choice: field names are string literals known at compile time, so
+/// there's no need to allocate a `Vec` per watch call. Callers pass a
+/// `&["field_a", "field_b"]` literal which the compiler promotes to `'static`.
 pub fn watch(
     store: StoreId,
     fields: &'static [&'static str],

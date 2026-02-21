@@ -184,6 +184,39 @@ struct GdtRegister {
 }
 
 // ————————————————————————————————————————————————————————————————————————————
+// Segment descriptor constants
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Kernel code segment: DPL=0, 64-bit long mode (L=1), execute/read.
+///
+/// ```text
+/// G=1 | D=0 | L=1 | AVL=0 | Limit[19:16]=F | P=1 | DPL=00 | S=1 | Type=1010
+/// Base = 0, Limit = 0xFFFFF (ignored in long mode).
+/// ```
+const KERNEL_CODE_DESC: u64 = 0x00AF_9A00_0000_FFFF;
+
+/// Kernel data segment: DPL=0, 32-bit compatible (D=1), read/write.
+///
+/// ```text
+/// G=1 | D=1 | L=0 | AVL=0 | Limit[19:16]=F | P=1 | DPL=00 | S=1 | Type=0010
+/// ```
+const KERNEL_DATA_DESC: u64 = 0x00CF_9200_0000_FFFF;
+
+/// User data segment: DPL=3, 32-bit compatible (D=1), read/write.
+///
+/// ```text
+/// G=1 | D=1 | L=0 | AVL=0 | Limit[19:16]=F | P=1 | DPL=11 | S=1 | Type=0010
+/// ```
+const USER_DATA_DESC: u64 = 0x00CF_F200_0000_FFFF;
+
+/// User code segment: DPL=3, 64-bit long mode (L=1), execute/read.
+///
+/// ```text
+/// G=1 | D=0 | L=1 | AVL=0 | Limit[19:16]=F | P=1 | DPL=11 | S=1 | Type=1010
+/// ```
+const USER_CODE_DESC: u64 = 0x00AF_FA00_0000_FFFF;
+
+// ————————————————————————————————————————————————————————————————————————————
 // Initialization
 // ————————————————————————————————————————————————————————————————————————————
 
@@ -224,10 +257,10 @@ pub(crate) unsafe fn init_gdt_tss(gdt: &mut [u64; 7], tss: &mut Tss, df_stack: &
         // See the static GDT doc comment for the full entry layout.
         // The magic constants encode present bits, DPL, type, and flags.
         gdt[0] = 0;                         // Null descriptor (required)
-        gdt[1] = 0x00AF_9A00_0000_FFFF;     // Kernel code (DPL=0, L=1)
-        gdt[2] = 0x00CF_9200_0000_FFFF;     // Kernel data (DPL=0)
-        gdt[3] = 0x00CF_F200_0000_FFFF;     // User data   (DPL=3)
-        gdt[4] = 0x00AF_FA00_0000_FFFF;     // User code   (DPL=3, L=1)
+        gdt[1] = KERNEL_CODE_DESC;           // Kernel code (DPL=0, L=1)
+        gdt[2] = KERNEL_DATA_DESC;           // Kernel data (DPL=0)
+        gdt[3] = USER_DATA_DESC;             // User data   (DPL=3)
+        gdt[4] = USER_CODE_DESC;             // User code   (DPL=3, L=1)
 
         // Entries 5–6: TSS descriptor (16 bytes — two u64 slots).
         // System descriptors need a full 64-bit base, so they span two GDT entries.

@@ -36,6 +36,23 @@ pub use store_value::StoreValue;
 pub use value::Value;
 
 // ————————————————————————————————————————————————————————————————————————————
+// Syscall numbers — shared between kernel and userspace
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Read fields from a store. Multi-field packed buffer protocol.
+pub const SYS_STORE_GET: u64 = 0;
+/// Write fields to a store. Multi-field packed buffer protocol.
+pub const SYS_STORE_SET: u64 = 1;
+/// Register a persistent watcher on a store field.
+pub const SYS_SUBSCRIBE: u64 = 2;
+/// Remove a persistent watcher by subscription ID.
+pub const SYS_UNSUBSCRIBE: u64 = 3;
+/// Sleep until at least one subscription fires.
+pub const SYS_YIELD: u64 = 4;
+/// Dispatch a typed mutation to a store's reducer.
+pub const SYS_STORE_MUTATE: u64 = 5;
+
+// ————————————————————————————————————————————————————————————————————————————
 // Process mutation IDs — shared between kernel and userspace
 // ————————————————————————————————————————————————————————————————————————————
 

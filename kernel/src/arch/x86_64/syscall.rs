@@ -105,16 +105,9 @@ const IA32_FMASK: u32 = 0xC000_0084;
 /// SCE — System Call Enable bit in IA32_EFER.
 const EFER_SCE: u64 = 1 << 0;
 
-// ————————————————————————————————————————————————————————————————————————————
-// Syscall numbers
-// ————————————————————————————————————————————————————————————————————————————
-
-const SYS_STORE_GET: u64 = 0;
-const SYS_STORE_SET: u64 = 1;
-const SYS_SUBSCRIBE: u64 = 2;
-const SYS_UNSUBSCRIBE: u64 = 3;
-const SYS_YIELD: u64 = 4;
-const SYS_STORE_MUTATE: u64 = 5;
+use oboos_api::{
+    SYS_STORE_GET, SYS_STORE_SET, SYS_SUBSCRIBE, SYS_UNSUBSCRIBE, SYS_YIELD, SYS_STORE_MUTATE,
+};
 
 // ————————————————————————————————————————————————————————————————————————————
 // Well-known store IDs
@@ -226,47 +219,7 @@ fn resolve_store_id(raw: u64) -> Option<StoreId> {
     }
 }
 
-// ————————————————————————————————————————————————————————————————————————————
-// MSR helpers
-// ————————————————————————————————————————————————————————————————————————————
-
-/// Read a Model-Specific Register.
-///
-/// MSRs are CPU configuration registers addressed by a 32-bit index.
-/// `rdmsr` loads ECX with the index and returns the 64-bit value split
-/// across EDX:EAX (high:low) — a convention from the 32-bit era that
-/// persists in 64-bit mode.
-unsafe fn rdmsr(msr: u32) -> u64 {
-    let lo: u32;
-    let hi: u32;
-    unsafe {
-        core::arch::asm!(
-            "rdmsr",
-            in("ecx") msr,
-            out("eax") lo,
-            out("edx") hi,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    ((hi as u64) << 32) | (lo as u64)
-}
-
-/// Write a Model-Specific Register.
-///
-/// Same EDX:EAX split as `rdmsr`, just in the write direction.
-unsafe fn wrmsr(msr: u32, value: u64) {
-    let lo = value as u32;
-    let hi = (value >> 32) as u32;
-    unsafe {
-        core::arch::asm!(
-            "wrmsr",
-            in("ecx") msr,
-            in("eax") lo,
-            in("edx") hi,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-}
+use super::msr::{rdmsr, wrmsr};
 
 // ————————————————————————————————————————————————————————————————————————————
 // Syscall entry point state

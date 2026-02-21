@@ -514,13 +514,13 @@ impl Reducer for ProcessStoreSchema {
     fn deserialize(id: u8, payload: &[u8]) -> Result<ProcessMutation, StoreError> {
         match id {
             oboos_api::PROCESS_MUTATE_MAP_HEAP => {
-                if payload.len() != 8 { return Err(StoreError::InvalidArg); }
-                let pages = u64::from_ne_bytes(payload[..8].try_into().unwrap());
+                let bytes: [u8; 8] = payload.try_into().map_err(|_| StoreError::InvalidArg)?;
+                let pages = u64::from_ne_bytes(bytes);
                 Ok(ProcessMutation::MapHeap { pages })
             }
             oboos_api::PROCESS_MUTATE_EXIT => {
-                if payload.len() != 8 { return Err(StoreError::InvalidArg); }
-                let code = u64::from_ne_bytes(payload[..8].try_into().unwrap());
+                let bytes: [u8; 8] = payload.try_into().map_err(|_| StoreError::InvalidArg)?;
+                let code = u64::from_ne_bytes(bytes);
                 Ok(ProcessMutation::Exit { code })
             }
             _ => Err(StoreError::InvalidArg),

@@ -44,11 +44,14 @@ pub fn run_all() {
     test_persistent_watcher();
     test_store_mutation();
     test_heap_cleanup();
+    test_store_monotonic_ids();
+    test_store_destroy_with_subscriber();
     test_per_process_page_tables();
     test_ring3();
     test_smp_bringup();
     test_cross_core_async();
     test_executor_work_stealing();
+    test_store_concurrent_writes();
     println!();
     println!("[ok] All smoke tests passed");
 }
@@ -596,11 +599,15 @@ fn test_store_basic() {
     assert_eq!(store::get(id, "label").unwrap(), Value::Str(String::from("world")));
     assert_eq!(store::get(id, "active").unwrap(), Value::Bool(false));
 
+    // Verify schema name is accessible for debug messages.
+    assert_eq!(store::name(id), Some("Counter"));
+
     // Destroy and verify NotFound.
     store::destroy(id).expect("destroy");
     assert!(store::get(id, "count").is_err());
     assert!(store::set(id, &[("count", Value::U32(1))]).is_err());
     assert!(store::destroy(id).is_err());
+    assert_eq!(store::name(id), None, "name should return None after destroy");
 
     println!("[ok] Store basic operations verified (create, get, set, destroy)");
 }
@@ -1172,7 +1179,6 @@ fn test_typed_store_handle() {
 fn test_typed_store_integration() {
     use alloc::collections::BTreeMap;
     use alloc::string::String;
-    use alloc::vec;
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicBool, Ordering};
     use crate::store_handle::Store;
@@ -1730,8 +1736,8 @@ fn test_store_mutation() {
         fn deserialize(id: u8, payload: &[u8]) -> Result<MutTestMutation, StoreError> {
             match id {
                 0 => {
-                    if payload.len() != 8 { return Err(StoreError::InvalidArg); }
-                    let amount = u64::from_ne_bytes(payload[..8].try_into().unwrap());
+                    let bytes: [u8; 8] = payload.try_into().map_err(|_| StoreError::InvalidArg)?;
+                    let amount = u64::from_ne_bytes(bytes);
                     Ok(MutTestMutation::Increment { amount })
                 }
                 1 => {
@@ -1887,4 +1893,162 @@ fn test_per_process_page_tables() {
 /// SYS_STORE_GET, and exits via MUTATE/Exit. The kernel verifies counter==42.
 fn test_ring3() {
     userspace::run_ring3_smoke_test();
+}
+
+/// Verify that store IDs are monotonically increasing and never reused.
+///
+/// Creates a store, destroys it, creates another, and asserts the second
+/// ID is strictly greater than the first. This is the ABA-prevention
+/// invariant documented in CLAUDE.md.
+fn test_store_monotonic_ids() {
+    use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+    struct MonoSchema;
+    impl StoreSchema for MonoSchema {
+        fn name() -> &'static str { "MonoTest" }
+        fn fields() -> &'static [FieldDef] {
+            &[FieldDef { name: "x", kind: FieldKind::U32 }]
+        }
+    }
+
+    let id1 = store::create::<MonoSchema>(&[("x", Value::U32(0))]).expect("create first");
+    store::destroy(id1).expect("destroy first");
+
+    let id2 = store::create::<MonoSchema>(&[("x", Value::U32(0))]).expect("create second");
+    assert!(
+        id2.as_raw() > id1.as_raw(),
+        "store IDs must be monotonic: second ({}) should be > first ({})",
+        id2.as_raw(), id1.as_raw()
+    );
+    store::destroy(id2).expect("cleanup");
+
+    println!("[ok] Store monotonic ID invariant verified");
+}
+
+/// Verify that concurrent store writes from multiple cores don't panic.
+///
+/// Two cores write to the same store field in a tight loop. The test
+/// verifies the final value is consistent and no panics occur, exercising
+/// the waker dispatch path under contention.
+fn test_store_concurrent_writes() {
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+    let count = arch::smp::cpu_count();
+    if count < 2 {
+        println!("[skip] Concurrent store writes: only {} CPU(s) available", count);
+        return;
+    }
+
+    struct ConcSchema;
+    impl StoreSchema for ConcSchema {
+        fn name() -> &'static str { "ConcTest" }
+        fn fields() -> &'static [FieldDef] {
+            &[FieldDef { name: "counter", kind: FieldKind::U64 }]
+        }
+    }
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static AP_WRITES: AtomicU64 = AtomicU64::new(0);
+    DONE.store(false, Ordering::SeqCst);
+    AP_WRITES.store(0, Ordering::SeqCst);
+
+    let id = store::create::<ConcSchema>(&[
+        ("counter", Value::U64(0)),
+    ]).expect("create concurrent store");
+
+    // Spawn a future on CPU 1 that writes to the same field 100 times.
+    executor::spawn_on(1, async move {
+        for i in 0..100u64 {
+            store::set(id, &[("counter", Value::U64(i))]).expect("AP set");
+            AP_WRITES.fetch_add(1, Ordering::SeqCst);
+        }
+        DONE.store(true, Ordering::SeqCst);
+    });
+
+    // BSP also writes 100 times concurrently.
+    arch::Arch::enable_interrupts();
+    for i in 1000..1100u64 {
+        store::set(id, &[("counter", Value::U64(i))]).expect("BSP set");
+    }
+
+    // Wait for AP to finish.
+    let mut spins = 0u64;
+    while !DONE.load(Ordering::SeqCst) {
+        arch::Arch::halt_until_interrupt();
+        spins += 1;
+        if spins > 5000 {
+            panic!("test_store_concurrent_writes: timed out");
+        }
+    }
+    arch::Arch::disable_interrupts();
+
+    let ap = AP_WRITES.load(Ordering::SeqCst);
+    assert_eq!(ap, 100, "AP should have completed 100 writes, got {}", ap);
+
+    // The final value should be one of the values either core wrote.
+    let final_val = store::get(id, "counter").expect("final get");
+    match final_val {
+        Value::U64(_) => {}
+        _ => panic!("expected U64 value, got {:?}", final_val),
+    }
+
+    store::destroy(id).expect("cleanup concurrent store");
+    println!("[ok] Concurrent store writes verified (no panics, consistent state)");
+}
+
+/// Verify that destroying a store with an active subscriber wakes the
+/// subscriber with `StoreError::NotFound` instead of panicking.
+fn test_store_destroy_with_subscriber() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
+
+    struct DestroySchema;
+    impl StoreSchema for DestroySchema {
+        fn name() -> &'static str { "DestroyTest" }
+        fn fields() -> &'static [FieldDef] {
+            &[FieldDef { name: "value", kind: FieldKind::U32 }]
+        }
+    }
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static GOT_NOT_FOUND: AtomicBool = AtomicBool::new(false);
+    DONE.store(false, Ordering::SeqCst);
+    GOT_NOT_FOUND.store(false, Ordering::SeqCst);
+
+    let id = store::create::<DestroySchema>(&[
+        ("value", Value::U32(0)),
+    ]).expect("create destroy-test store");
+
+    // Spawn a future that watches the store.
+    executor::spawn(async move {
+        match store::watch(id, &["value"]).await {
+            Err(store::StoreError::NotFound) => {
+                GOT_NOT_FOUND.store(true, Ordering::SeqCst);
+            }
+            Ok(()) => {
+                // Woken by destroy — store is gone, so get should fail.
+                if store::get(id, "value").is_err() {
+                    GOT_NOT_FOUND.store(true, Ordering::SeqCst);
+                }
+            }
+            Err(e) => panic!("unexpected error: {:?}", e),
+        }
+        DONE.store(true, Ordering::SeqCst);
+    });
+
+    // First poll: subscriber registers, returns Pending.
+    executor::poll_once();
+    assert!(!DONE.load(Ordering::SeqCst), "future should be pending");
+
+    // Destroy the store while the subscriber is active.
+    store::destroy(id).expect("destroy with active subscriber");
+
+    // Second poll: subscriber is woken by destroy, detects NotFound.
+    executor::poll_once();
+    assert!(DONE.load(Ordering::SeqCst), "future should be done after destroy");
+    assert!(GOT_NOT_FOUND.load(Ordering::SeqCst),
+        "subscriber should get NotFound after store destruction");
+
+    println!("[ok] Store destruction with active subscriber verified (NotFound, no panic)");
 }

@@ -61,6 +61,19 @@ pub const TLB_SHOOTDOWN_VECTOR: u8 = 50;
 /// The handler is a no-op that does NOT send EOI.
 const SPURIOUS_VECTOR: u8 = 0xFF;
 
+/// Bit 8 of the spurious vector register: software enable for the LAPIC.
+const LAPIC_SW_ENABLE: u32 = 1 << 8;
+
+/// Bit 16 of the timer LVT register: mask (disable) the timer interrupt.
+const LAPIC_TIMER_MASKED: u32 = 1 << 16;
+
+/// Bit 17 of the timer LVT register: periodic mode (vs. one-shot).
+const LAPIC_TIMER_PERIODIC: u32 = 1 << 17;
+
+/// Divide-by-16 encoding for the timer divide configuration register.
+/// Bits [3,1,0] = 011 = divide by 16.
+const LAPIC_DIV_16: u32 = 0b0011;
+
 // ————————————————————————————————————————————————————————————————————————————
 // Global state
 // ————————————————————————————————————————————————————————————————————————————
@@ -98,24 +111,7 @@ unsafe fn write(offset: u32, value: u32) {
     unsafe { core::ptr::write_volatile(addr as *mut u32, value) }
 }
 
-// ————————————————————————————————————————————————————————————————————————————
-// MSR helpers
-// ————————————————————————————————————————————————————————————————————————————
-
-unsafe fn rdmsr(msr: u32) -> u64 {
-    let lo: u32;
-    let hi: u32;
-    unsafe {
-        core::arch::asm!(
-            "rdmsr",
-            in("ecx") msr,
-            out("eax") lo,
-            out("edx") hi,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    ((hi as u64) << 32) | (lo as u64)
-}
+use super::msr::rdmsr;
 
 // ————————————————————————————————————————————————————————————————————————————
 // Public API
@@ -142,15 +138,14 @@ pub fn init() {
 
         LAPIC_BASE = phys_to_virt(phys_base) as u64;
 
-        // Enable the APIC by setting bit 8 (APIC Software Enable) in the
-        // spurious interrupt vector register. Also set the spurious vector.
-        write(LAPIC_SPURIOUS, 0x100 | SPURIOUS_VECTOR as u32);
+        // Enable the APIC via the software enable bit in the spurious
+        // interrupt vector register. Also set the spurious vector.
+        write(LAPIC_SPURIOUS, LAPIC_SW_ENABLE | SPURIOUS_VECTOR as u32);
 
         // Set timer divide to 16. The divide register controls how the bus
         // clock is divided before reaching the timer counter. Lower divisors
         // give finer granularity but overflow faster. 16 is a good balance.
-        // Encoding: 0b0011 = divide by 16.
-        write(LAPIC_TIMER_DIVIDE, 0x03);
+        write(LAPIC_TIMER_DIVIDE, LAPIC_DIV_16);
 
         // Calibrate: measure APIC timer ticks in a known PIT interval.
         let ticks_per_ms = calibrate_timer();
@@ -180,18 +175,18 @@ pub fn init_ap() {
 
         // Enable APIC + set spurious vector.
         let addr = base + LAPIC_SPURIOUS as u64;
-        core::ptr::write_volatile(addr as *mut u32, 0x100 | SPURIOUS_VECTOR as u32);
+        core::ptr::write_volatile(addr as *mut u32, LAPIC_SW_ENABLE | SPURIOUS_VECTOR as u32);
 
         // Set timer divide to 16 (same as BSP).
         let addr = base + LAPIC_TIMER_DIVIDE as u64;
-        core::ptr::write_volatile(addr as *mut u32, 0x03);
+        core::ptr::write_volatile(addr as *mut u32, LAPIC_DIV_16);
 
         // Start periodic timer with the calibrated value.
         let ticks_per_ms = APIC_TICKS_PER_MS;
 
-        // Program timer LVT: periodic mode (bit 17), our timer vector.
+        // Program timer LVT: periodic mode, our timer vector.
         let addr = base + LAPIC_TIMER_LVT as u64;
-        core::ptr::write_volatile(addr as *mut u32, (1 << 17) | TIMER_VECTOR as u32);
+        core::ptr::write_volatile(addr as *mut u32, LAPIC_TIMER_PERIODIC | TIMER_VECTOR as u32);
 
         // Set initial count — timer fires every 1ms.
         let addr = base + LAPIC_TIMER_INIT as u64;
@@ -242,8 +237,8 @@ pub fn id() -> u32 {
 /// Start the APIC timer in periodic mode at 1 kHz.
 fn start_timer(ticks_per_ms: u32) {
     unsafe {
-        // Program timer LVT: periodic mode (bit 17), our timer vector.
-        write(LAPIC_TIMER_LVT, (1 << 17) | TIMER_VECTOR as u32);
+        // Program timer LVT: periodic mode, our timer vector.
+        write(LAPIC_TIMER_LVT, LAPIC_TIMER_PERIODIC | TIMER_VECTOR as u32);
         // Set initial count — timer reloads this value each period.
         write(LAPIC_TIMER_INIT, ticks_per_ms);
     }
@@ -258,7 +253,7 @@ fn calibrate_timer() -> u32 {
     unsafe {
         // Start APIC timer counting down from max (one-shot, masked so
         // it doesn't fire an interrupt — we just read the current count).
-        write(LAPIC_TIMER_LVT, 0x10000); // masked (bit 16)
+        write(LAPIC_TIMER_LVT, LAPIC_TIMER_MASKED);
         write(LAPIC_TIMER_INIT, 0xFFFF_FFFF);
 
         // Program PIT channel 0 for a 10ms one-shot.
@@ -286,7 +281,7 @@ fn calibrate_timer() -> u32 {
         let elapsed = 0xFFFF_FFFFu32 - current;
 
         // Stop the APIC timer (mask it).
-        write(LAPIC_TIMER_LVT, 0x10000);
+        write(LAPIC_TIMER_LVT, LAPIC_TIMER_MASKED);
         write(LAPIC_TIMER_INIT, 0);
 
         // ticks_per_ms = elapsed_in_10ms / 10
