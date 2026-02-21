@@ -6,15 +6,16 @@
 //!
 //! ## Syscall interface
 //!
-//! Five syscalls express all kernel interaction through the store:
+//! Six syscalls express all kernel interaction through the store:
 //!
-//! | # | Name            | Args                                               | Returns            |
-//! |---|-----------------|----------------------------------------------------|--------------------|
-//! | 0 | SYS_STORE_GET   | store_id, fields_ptr, fields_len, out_ptr, out_len | bytes written      |
-//! | 1 | SYS_STORE_SET   | store_id, buf_ptr, buf_len, 0, 0                   | 0 on success       |
-//! | 2 | SYS_SUBSCRIBE   | store_id, field_ptr, field_len, 0, 0               | sub_id (0-63)      |
-//! | 3 | SYS_UNSUBSCRIBE | sub_id, 0, 0, 0, 0                                | 0 on success       |
-//! | 4 | SYS_YIELD       | 0, 0, 0, 0, 0                                     | fired bitmask      |
+//! | # | Name            | Args                                                    | Returns            |
+//! |---|-----------------|----------------------------------------------------------|--------------------|
+//! | 0 | SYS_STORE_GET   | store_id, fields_ptr, fields_len, out_ptr, out_len      | bytes written      |
+//! | 1 | SYS_STORE_SET   | store_id, buf_ptr, buf_len, 0, 0                        | 0 on success       |
+//! | 2 | SYS_SUBSCRIBE   | store_id, field_ptr, field_len, 0, 0                    | sub_id (0-63)      |
+//! | 3 | SYS_UNSUBSCRIBE | sub_id, 0, 0, 0, 0                                     | 0 on success       |
+//! | 4 | SYS_YIELD       | 0, 0, 0, 0, 0                                          | fired bitmask      |
+//! | 5 | SYS_STORE_MUTATE| store_id, mutation_id, payload_ptr, payload_len, 0      | mutation-specific   |
 //!
 //! GET and SET use packed buffers with u16 length prefixes for multi-field
 //! operations. All use 5 arguments passed in RDI, RSI, RDX, R10, R8
@@ -46,8 +47,12 @@
 
 #![no_std]
 
+extern crate alloc;
+
+use core::alloc::{GlobalAlloc, Layout};
 use core::future::Future;
 use core::pin::Pin;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
@@ -62,6 +67,7 @@ pub const SYS_STORE_SET: u64 = 1;
 pub const SYS_SUBSCRIBE: u64 = 2;
 pub const SYS_UNSUBSCRIBE: u64 = 3;
 pub const SYS_YIELD: u64 = 4;
+pub const SYS_STORE_MUTATE: u64 = 5;
 
 // ————————————————————————————————————————————————————————————————————————————
 // Well-known store IDs
@@ -323,6 +329,86 @@ pub fn store_set(store_id: u64, field: &str, value: impl IntoStoreBytes) -> Resu
     Ok(())
 }
 
+// ————————————————————————————————————————————————————————————————————————————
+// MUTATE syscall helpers
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Request `pages` heap pages from the kernel via the MapHeap mutation.
+///
+/// Returns the virtual address of the start of the newly mapped region,
+/// or an error code (check with [`is_error`]).
+pub fn sys_mutate_map_heap(pages: u64) -> u64 {
+    let payload = pages.to_ne_bytes();
+    syscall5(
+        SYS_STORE_MUTATE,
+        PROCESS,
+        oboos_api::PROCESS_MUTATE_MAP_HEAP as u64,
+        payload.as_ptr() as u64,
+        8,
+        0,
+    )
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// Global heap allocator — grows via MapHeap mutation
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Userspace heap allocator that uses the kernel's MapHeap mutation to grow.
+///
+/// Wraps `linked_list_allocator::Heap` behind a spinlock. On OOM, requests
+/// more pages from the kernel (minimum 4 pages = 16 KiB per grow) and
+/// extends the heap. The kernel maps the pages into the process's heap
+/// region starting at 0x0100_0000.
+struct OboosAllocator {
+    inner: spin::Mutex<linked_list_allocator::Heap>,
+}
+
+impl OboosAllocator {
+    const fn new() -> Self {
+        OboosAllocator {
+            inner: spin::Mutex::new(linked_list_allocator::Heap::empty()),
+        }
+    }
+}
+
+unsafe impl GlobalAlloc for OboosAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let mut heap = self.inner.lock();
+        match heap.allocate_first_fit(layout) {
+            Ok(ptr) => ptr.as_ptr(),
+            Err(_) => {
+                // OOM — ask the kernel for more pages.
+                let needed = layout.size().max(layout.align());
+                let pages = ((needed + 4095) / 4096).max(4); // min 16 KiB per grow
+                let addr = sys_mutate_map_heap(pages as u64);
+                if is_error(addr) {
+                    return core::ptr::null_mut();
+                }
+
+                if heap.size() == 0 {
+                    // First heap allocation — initialize the heap.
+                    unsafe { heap.init(addr as *mut u8, pages * 4096); }
+                } else {
+                    // Extend the existing heap with the new pages.
+                    unsafe { heap.extend(pages * 4096); }
+                }
+
+                heap.allocate_first_fit(layout)
+                    .map_or(core::ptr::null_mut(), |p| p.as_ptr())
+            }
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe {
+            self.inner.lock().deallocate(NonNull::new_unchecked(ptr), layout);
+        }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: OboosAllocator = OboosAllocator::new();
+
 /// Write a string to the serial console.
 ///
 /// Pushes a string onto the `"output"` queue on the [`CONSOLE`] store.
@@ -341,16 +427,19 @@ pub fn getpid() -> u64 {
 
 /// Exit the program with an exit code, returning control to the kernel.
 ///
-/// Sets both `exit_code` and `status` in a single atomic SYS_STORE_SET call.
-/// The kernel detects `status="exiting"` as a side-effect trigger: it reads
-/// the exit code, transitions the process to Exited, and longjmps back to
-/// whoever called `jump_to_ring3`. The syscall never returns.
+/// Issues a MUTATE(PROCESS, Exit, code) syscall. The kernel's process store
+/// reducer sets status="exited" and exit_code, then triggers the longjmp
+/// back to whoever called `jump_to_ring3`. The syscall never returns.
 pub fn exit(code: u64) -> ! {
-    let mut buf = [0u8; 64];
-    let mut off = 0;
-    encode_pair(&mut buf, &mut off, "exit_code", &code.to_ne_bytes());
-    encode_pair(&mut buf, &mut off, "status", b"exiting");
-    syscall5(SYS_STORE_SET, PROCESS, buf.as_ptr() as u64, off as u64, 0, 0);
+    let payload = code.to_ne_bytes();
+    syscall5(
+        SYS_STORE_MUTATE,
+        PROCESS,
+        oboos_api::PROCESS_MUTATE_EXIT as u64,
+        payload.as_ptr() as u64,
+        8,
+        0,
+    );
     loop {}
 }
 

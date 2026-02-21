@@ -4,4 +4,6 @@ version = "0.0.1"
 edition = "2024"
 
 [dependencies]
+linked_list_allocator = "0.10"
 oboos-api = { path = "../../api", default-features = false }
+spin = "0.9"

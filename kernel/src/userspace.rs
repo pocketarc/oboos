@@ -12,8 +12,13 @@
 //!
 //! ```text
 //! 0x0040_0000+  ELF segments  (PRESENT | USER, permissions from ELF flags)
-//! 0x0080_0000           User stack    (PRESENT | WRITABLE | USER | NO_EXECUTE)
-//! 0xFFFF_FD00_...       Syscall kernel stack — 16 KiB + guard page (PRESENT | WRITABLE | NO_EXECUTE)
+//! 0x007B_F000   Guard page (unmapped — stack overflow = fatal)
+//! 0x007C_0000   Stack bottom (lowest demand-pageable address)
+//! ...           [mapped on demand as stack grows down]
+//! 0x007F_F000   Top page (pre-mapped at startup)
+//! 0x0080_0000   USER_STACK_TOP — initial RSP
+//! 0x0100_0000+  Heap region   (grows up via MUTATE/MapHeap)
+//! 0xFFFF_FD00_  Syscall kernel stack — 16 KiB + guard page (PRESENT | WRITABLE | NO_EXECUTE)
 //! ```
 //!
 //! ## Why a separate syscall kernel stack?
@@ -115,9 +120,6 @@ fn free_kernel_stack(alloc: KernelStackAlloc) {
 /// The Makefile ensures this is built before the kernel.
 static USER_ELF: &[u8] = include_bytes!("../../userspace/hello/target/x86_64-unknown-none/debug/oboos-hello");
 
-/// Virtual address for the user stack (top of page = initial RSP).
-const USER_STACK_VIRT: usize = 0x0080_0000;
-
 /// Store schema for the userspace test — a single U64 counter field.
 ///
 /// This is the application data store, separate from the process lifecycle
@@ -150,14 +152,10 @@ pub fn run_ring3_smoke_test() {
     // ── Step 2: Load the ELF binary ────────────────────────────────
     let loaded = elf::load_elf(USER_ELF);
 
-    // ── Step 3: Allocate and map the user stack page ───────────────
-    let stack_frame = memory::alloc_frame().expect("alloc user stack frame");
-    arch::Arch::map_page(
-        USER_STACK_VIRT,
-        stack_frame,
-        PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER | PageFlags::NO_EXECUTE,
-    );
-    let user_rsp = (USER_STACK_VIRT + memory::FRAME_SIZE) as u64;
+    // ── Step 3: Set up the demand-paged user stack ──────────────
+    // Only pre-maps a single page; the rest are demand-paged via #PF.
+    process::init_stack(pid);
+    let user_rsp = process::USER_STACK_TOP as u64;
 
     // ── Step 4: Allocate the syscall kernel stack ──────────────────
     let kern_stack = alloc_kernel_stack();
@@ -234,13 +232,11 @@ pub fn run_ring3_smoke_test() {
     println!("[ok] Process store verified (status=exited, exit_code=0)");
 
     // ── Step 9: Clean up ───────────────────────────────────────────
+    // Stack frames are freed automatically by process::destroy().
     arch::syscall::destroy_console_store(console_store_id);
     store::destroy(data_store_id).expect("destroy user test store");
     process::destroy(pid);
     loaded.unload();
-
-    arch::Arch::unmap_page(USER_STACK_VIRT);
-    memory::free_frame(stack_frame);
     free_kernel_stack(kern_stack);
 }
 
@@ -258,13 +254,8 @@ pub fn run_hello_interactive() {
 
     let loaded = elf::load_elf(USER_ELF);
 
-    let stack_frame = memory::alloc_frame().expect("alloc user stack frame");
-    arch::Arch::map_page(
-        USER_STACK_VIRT,
-        stack_frame,
-        PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER | PageFlags::NO_EXECUTE,
-    );
-    let user_rsp = (USER_STACK_VIRT + memory::FRAME_SIZE) as u64;
+    process::init_stack(pid);
+    let user_rsp = process::USER_STACK_TOP as u64;
 
     let kern_stack = alloc_kernel_stack();
     let kern_stack_rsp = kern_stack.stack_top as u64;
@@ -302,13 +293,10 @@ pub fn run_hello_interactive() {
     };
     println!("[user] Process exited (code={})", exit_code);
 
-    // Clean up.
+    // Clean up. Stack frames are freed automatically by process::destroy().
     arch::syscall::destroy_console_store(console_store_id);
     store::destroy(data_store_id).ok();
     process::destroy(pid);
     loaded.unload();
-
-    arch::Arch::unmap_page(USER_STACK_VIRT);
-    memory::free_frame(stack_frame);
     free_kernel_stack(kern_stack);
 }

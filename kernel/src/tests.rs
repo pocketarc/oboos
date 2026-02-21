@@ -42,6 +42,8 @@ pub fn run_all() {
     test_error_codes();
     test_multi_field_set();
     test_persistent_watcher();
+    test_store_mutation();
+    test_heap_cleanup();
     test_ring3();
     test_smp_bringup();
     test_cross_core_async();
@@ -1673,12 +1675,161 @@ fn test_executor_work_stealing() {
     println!("[ok] Executor work stealing verified ({}/{} futures stolen by APs)", stolen, total);
 }
 
+/// Verify store mutations: register a reducer, dispatch mutations, verify results.
+///
+/// Defines a custom schema with a reducer that supports an Increment mutation,
+/// and verifies that mutate() dispatches correctly and wakers fire.
+fn test_store_mutation() {
+    use alloc::string::String;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use crate::store_handle::Store;
+    use crate::store::Reducer;
+    use oboos_api::{FieldDef, FieldKind, StoreError, StoreSchema, Value};
+
+    struct MutTestSchema;
+    impl StoreSchema for MutTestSchema {
+        fn name() -> &'static str { "MutTest" }
+        fn fields() -> &'static [FieldDef] {
+            &[
+                FieldDef { name: "count", kind: FieldKind::U64 },
+                FieldDef { name: "label", kind: FieldKind::Str },
+            ]
+        }
+    }
+
+    enum MutTestMutation {
+        Increment { amount: u64 },
+        SetLabel { label: String },
+    }
+
+    impl Reducer for MutTestSchema {
+        type Mutation = MutTestMutation;
+
+        fn reduce(
+            store: &mut crate::store::StoreAccessor,
+            mutation: MutTestMutation,
+        ) -> Result<u64, StoreError> {
+            match mutation {
+                MutTestMutation::Increment { amount } => {
+                    let current: u64 = store.get("count")?;
+                    let new_val = current + amount;
+                    store.set("count", new_val)?;
+                    Ok(new_val)
+                }
+                MutTestMutation::SetLabel { label } => {
+                    store.set("label", label)?;
+                    Ok(0)
+                }
+            }
+        }
+
+        fn deserialize(id: u8, payload: &[u8]) -> Result<MutTestMutation, StoreError> {
+            match id {
+                0 => {
+                    if payload.len() != 8 { return Err(StoreError::InvalidArg); }
+                    let amount = u64::from_ne_bytes(payload[..8].try_into().unwrap());
+                    Ok(MutTestMutation::Increment { amount })
+                }
+                1 => {
+                    let label = core::str::from_utf8(payload)
+                        .map_err(|_| StoreError::InvalidArg)?;
+                    Ok(MutTestMutation::SetLabel { label: String::from(label) })
+                }
+                _ => Err(StoreError::InvalidArg),
+            }
+        }
+    }
+
+    let s = Store::<MutTestSchema>::create(&[
+        ("count", Value::U64(0)),
+        ("label", Value::Str(String::from("init"))),
+    ]).expect("create mutation test store");
+    s.register_reducer().expect("register reducer");
+
+    let pid = process::Pid::from_raw(0); // dummy pid for kernel-side test
+
+    // Dispatch Increment(10) mutation.
+    let result = s.mutate(pid, 0, &10u64.to_ne_bytes()).expect("mutate increment");
+    assert_eq!(result.value, 10, "Increment(10) should return 10");
+    assert_eq!(s.get::<u64>("count").unwrap(), 10);
+
+    // Dispatch Increment(5) again.
+    let result = s.mutate(pid, 0, &5u64.to_ne_bytes()).expect("mutate increment 2");
+    assert_eq!(result.value, 15, "Increment(5) should return 15");
+    assert_eq!(s.get::<u64>("count").unwrap(), 15);
+
+    // Dispatch SetLabel.
+    let result = s.mutate(pid, 1, b"updated").expect("mutate set label");
+    assert_eq!(result.value, 0);
+    assert_eq!(s.get::<String>("label").unwrap(), "updated");
+
+    // Invalid mutation ID → error.
+    assert!(s.mutate(pid, 99, &[]).is_err());
+
+    // Verify watcher fires on mutation.
+    static WATCH_DONE: AtomicBool = AtomicBool::new(false);
+    WATCH_DONE.store(false, Ordering::SeqCst);
+
+    let store_id = s.id();
+    executor::spawn(async move {
+        if store::watch(store_id, &["count"]).await.is_err() {
+            panic!("mutation watch failed");
+        }
+        WATCH_DONE.store(true, Ordering::SeqCst);
+    });
+
+    executor::poll_once();
+    assert!(!WATCH_DONE.load(Ordering::SeqCst));
+
+    let _ = s.mutate(pid, 0, &1u64.to_ne_bytes()).expect("mutate for watcher");
+    executor::poll_once();
+    assert!(WATCH_DONE.load(Ordering::SeqCst), "watcher should fire on mutation");
+
+    s.destroy().expect("cleanup mutation test store");
+    println!("[ok] Store mutations verified (Reducer dispatch, watchers fire)");
+}
+
+/// Verify that heap pages are cleaned up when a process is destroyed.
+///
+/// Spawns a process, allocates heap pages, then destroys the process and
+/// verifies the data frames are freed. Page table frames allocated by
+/// `map_page()` for intermediate levels are not freed (no page table
+/// reclamation yet), so we check that at least the data frames come back.
+fn test_heap_cleanup() {
+    let pid = process::spawn("heap-test");
+
+    // Allocate 4 heap pages via the process heap API.
+    let addr = process::map_heap_pages(pid, 4).expect("map 4 heap pages");
+    assert!(addr > 0, "heap address should be non-zero");
+    assert_eq!(addr as usize, 0x0100_0000, "first heap alloc should start at HEAP_REGION_START");
+
+    // Allocate 2 more pages.
+    let addr2 = process::map_heap_pages(pid, 2).expect("map 2 more heap pages");
+    assert_eq!(addr2 as usize, 0x0100_0000 + 4 * 4096, "second alloc should follow first");
+
+    // Record free frames before destroy.
+    let free_before_destroy = memory::free_frame_count();
+
+    // Destroy the process — should free all 6 heap data frames + the store.
+    process::destroy(pid);
+
+    let free_after_destroy = memory::free_frame_count();
+    let freed = free_after_destroy - free_before_destroy;
+    assert!(
+        freed >= 6,
+        "expected at least 6 data frames freed, got {} freed",
+        freed
+    );
+
+    println!("[ok] Heap cleanup verified ({} frames freed on process destroy)", freed);
+}
+
 /// Verify the Ring 3 store round trip: load an ELF, drop to user mode,
 /// read/write a kernel store via syscalls, and return.
 ///
 /// The userspace Rust program (compiled as ELF, embedded via include_bytes)
 /// sets a store field to 42 via SYS_STORE_SET, reads it back via
-/// SYS_STORE_GET, and exits via SYS_EXIT. The kernel verifies counter==42.
+/// SYS_STORE_GET, and exits via MUTATE/Exit. The kernel verifies counter==42.
 fn test_ring3() {
     userspace::run_ring3_smoke_test();
 }

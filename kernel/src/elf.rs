@@ -29,6 +29,10 @@
 //! [`LoadedElf::unload()`] unmaps and frees all allocated pages, making
 //! cleanup straightforward for the test harness.
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+
 use crate::arch;
 use crate::memory;
 use crate::platform::{MemoryManager, PageFlags};
@@ -101,15 +105,13 @@ pub struct LoadedElf {
     pub entry: u64,
     /// All (virt_addr, phys_addr) pairs allocated for PT_LOAD segments.
     /// Used by [`unload()`] to clean up.
-    pages: [(usize, usize); 32],
-    page_count: usize,
+    pages: Vec<(usize, usize)>,
 }
 
 impl LoadedElf {
     /// Unmap and free all pages allocated for this ELF binary.
     pub fn unload(self) {
-        for i in 0..self.page_count {
-            let (virt, phys) = self.pages[i];
+        for &(virt, phys) in &self.pages {
             arch::Arch::unmap_page(virt);
             memory::free_frame(phys);
         }
@@ -158,8 +160,7 @@ pub fn load_elf(binary: &[u8]) -> LoadedElf {
 
     println!("[elf] Loading ELF binary ({} bytes, {} program headers, entry={:#X})", binary.len(), phnum, entry);
 
-    let mut pages: [(usize, usize); 32] = [(0, 0); 32];
-    let mut page_count = 0;
+    let mut pages: Vec<(usize, usize)> = Vec::new();
     let mut segments_loaded = 0;
 
     for i in 0..phnum {
@@ -200,8 +201,7 @@ pub fn load_elf(binary: &[u8]) -> LoadedElf {
             // This happens when two segments share a page boundary (e.g. .rodata
             // and .got can land on the same 4K page). In that case, reuse the
             // existing frame — just copy additional data into it.
-            let existing_phys = pages[..page_count]
-                .iter()
+            let existing_phys = pages.iter()
                 .find(|&&(v, _)| v == page_virt)
                 .map(|&(_, phys)| phys);
 
@@ -216,9 +216,7 @@ pub fn load_elf(binary: &[u8]) -> LoadedElf {
 
                     // Map the new page and track it for cleanup.
                     arch::Arch::map_page(page_virt, f, page_flags);
-                    assert!(page_count < pages.len(), "too many ELF pages (max 32)");
-                    pages[page_count] = (page_virt, f);
-                    page_count += 1;
+                    pages.push((page_virt, f));
 
                     f
                 }
@@ -257,6 +255,5 @@ pub fn load_elf(binary: &[u8]) -> LoadedElf {
     LoadedElf {
         entry,
         pages,
-        page_count,
     }
 }

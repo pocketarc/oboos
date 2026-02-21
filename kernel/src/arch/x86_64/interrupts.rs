@@ -433,6 +433,19 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 ///   bit 1: 0 = read access, 1 = write access
 ///   bit 2: 0 = supervisor mode, 1 = user mode
 ///   bit 4: 0 = not instruction fetch, 1 = instruction fetch (NX violation)
+///
+/// ## Demand paging
+///
+/// When the fault is user-mode (bit 2) and page-not-present (bit 0 clear),
+/// we try demand-paging the user stack via [`process::grow_stack()`]. If it
+/// succeeds, we return normally — `extern "x86-interrupt"` generates `iretq`,
+/// which restores RIP to the faulting instruction. With the page now mapped,
+/// the retry succeeds transparently.
+///
+/// Lock safety: the fault fires from Ring 3, so no kernel locks are held.
+/// The CPU clears IF on #PF entry (interrupt gate). `grow_stack()` takes the
+/// process table lock and frame allocator lock — both safe with interrupts
+/// disabled, no deadlock risk.
 extern "x86-interrupt" fn page_fault_handler(
     frame: InterruptStackFrame,
     error_code: u64,
@@ -444,6 +457,14 @@ extern "x86-interrupt" fn page_fault_handler(
         core::arch::asm!("mov {}, cr2", out(reg) faulting_address, options(nomem, nostack));
     }
 
+    // User-mode, page-not-present → try demand-paging the stack.
+    if error_code & 4 != 0 && error_code & 1 == 0 {
+        if crate::process::grow_stack(faulting_address as usize).is_ok() {
+            return; // iretq retries the faulting instruction
+        }
+    }
+
+    // Not recoverable — print diagnostics and panic.
     crate::println!();
     crate::println!("EXCEPTION: Page Fault (#PF)");
     crate::println!("  Faulting address: {:#018X}", faulting_address);

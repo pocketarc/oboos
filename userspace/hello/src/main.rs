@@ -6,12 +6,20 @@
 //! prints the result to the serial console. Also demos interactive
 //! keyboard input via the console store's `"input"` queue and
 //! async subscriptions (SYS_SUBSCRIBE/SYS_YIELD).
+//!
+//! Now also demonstrates the userspace heap allocator: `format!()`,
+//! `String`, and `Vec` work via the `#[global_allocator]` in liboboos,
+//! which grows the heap through MUTATE/MapHeap syscalls.
 
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use alloc::format;
+use alloc::string::String;
 use liboboos::{
-    block_on, exit, getpid, store_get, store_set, watch, write, write_u64,
+    block_on, exit, getpid, store_get, store_set, watch, write,
     CONSOLE,
 };
 
@@ -26,33 +34,23 @@ pub extern "C" fn _start(store_id: u64) -> ! {
 async fn main(store_id: u64) {
     write("Hello from userspace Rust!\n");
 
-    // Print our PID to prove SYS_STORE_GET works.
+    // Print our PID using format!() — proves the heap allocator works.
     let pid = getpid();
-    let mut buf = [0u8; 64];
-    let prefix = b"My PID: ";
-    buf[..prefix.len()].copy_from_slice(prefix);
-    let mut pos = prefix.len();
-    pos += write_u64(&mut buf[pos..], pid);
-    buf[pos] = b'\n';
-    pos += 1;
-    let msg = unsafe { core::str::from_utf8_unchecked(&buf[..pos]) };
-    write(msg);
+    let msg = format!("My PID: {}\n", pid);
+    write(&msg);
 
     // Set counter=42 in the kernel store.
     store_set(store_id, "counter", 42u64).expect("set counter");
 
     // Read it back to verify the round trip.
     let val: u64 = store_get(store_id, "counter").expect("get counter");
+    let msg = format!("Store round-trip OK: counter={}\n", val);
+    write(&msg);
 
-    // Print the result: "Store round-trip OK: counter=NN\n"
-    let prefix2 = b"Store round-trip OK: counter=";
-    buf[..prefix2.len()].copy_from_slice(prefix2);
-    pos = prefix2.len();
-    pos += write_u64(&mut buf[pos..], val);
-    buf[pos] = b'\n';
-    pos += 1;
-    let msg = unsafe { core::str::from_utf8_unchecked(&buf[..pos]) };
-    write(msg);
+    // Prove String works: build a greeting dynamically.
+    let mut greeting = String::from("Heap works! ");
+    greeting.push_str("String + format!() from userspace.\n");
+    write(&greeting);
 
     // Interactive input: read keyboard input via the console store.
     write("Type something (Enter to finish): ");

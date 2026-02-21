@@ -34,3 +34,17 @@ pub use schema::{FieldDef, FieldKind, StoreSchema};
 pub use store_value::StoreValue;
 #[cfg(feature = "alloc")]
 pub use value::Value;
+
+// ————————————————————————————————————————————————————————————————————————————
+// Process mutation IDs — shared between kernel and userspace
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Mutation ID for `MapHeap { pages: u64 }` — allocate and map heap pages.
+/// Payload: 8 bytes (u64 page count, native endian).
+/// Returns: virtual address of the mapped region.
+pub const PROCESS_MUTATE_MAP_HEAP: u8 = 0;
+
+/// Mutation ID for `Exit { code: u64 }` — terminate the current process.
+/// Payload: 8 bytes (u64 exit code, native endian).
+/// Returns: 0 (never actually returned to userspace).
+pub const PROCESS_MUTATE_EXIT: u8 = 1;

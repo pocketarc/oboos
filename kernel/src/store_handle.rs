@@ -26,7 +26,8 @@ use core::marker::PhantomData;
 
 use oboos_api::{StoreSchema, StoreValue, Value};
 
-use crate::store::{self, StoreError, StoreId};
+use crate::process::Pid;
+use crate::store::{self, Reducer, StoreError, StoreId};
 
 /// A typed handle to a store instance, parameterized by its schema.
 ///
@@ -113,5 +114,25 @@ impl<S: StoreSchema> Store<S> {
     /// Destroy the underlying store instance.
     pub fn destroy(self) -> Result<(), StoreError> {
         store::destroy(self.id)
+    }
+}
+
+impl<S: Reducer> Store<S> {
+    /// Register this store's reducer, enabling MUTATE operations.
+    pub fn register_reducer(&self) -> Result<(), StoreError> {
+        store::register_reducer::<S>(self.id)
+    }
+
+    /// Dispatch a typed mutation on this store.
+    ///
+    /// The mutation is serialized via [`Reducer::deserialize`] and executed
+    /// atomically under the registry lock.
+    pub fn mutate(
+        &self,
+        pid: Pid,
+        mutation_id: u8,
+        payload: &[u8],
+    ) -> Result<store::MutateResult, StoreError> {
+        store::mutate(self.id, pid, mutation_id, payload)
     }
 }

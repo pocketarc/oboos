@@ -56,6 +56,7 @@ use core::task::Waker;
 
 use crate::arch::Arch;
 use crate::platform::Platform;
+use crate::process::Pid;
 use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
 
 pub use oboos_api::StoreError;
@@ -118,6 +119,134 @@ struct StoreInstance {
     data: BTreeMap<String, Value>,
     subscribers: Vec<Subscriber>,
     watchers: Vec<PersistentWatcher>,
+    /// Type-erased reducer for handling MUTATE syscalls. `None` if this store
+    /// doesn't support mutations (most don't — only process stores do for now).
+    reducer: Option<ReducerVtable>,
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// Reducer infrastructure — typed mutations dispatched through the store
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Mutable accessor passed to reducer functions, providing controlled access
+/// to the store's data and a limited set of kernel operations.
+///
+/// The accessor tracks which fields are modified so the store can fire only
+/// the relevant wakers after the reducer returns. It also supports deferred
+/// side-effects (like process exit) that must happen after the registry lock
+/// is released.
+pub struct StoreAccessor<'a> {
+    data: &'a mut BTreeMap<String, Value>,
+    fields: &'a [FieldDef],
+    /// Fields modified by this mutation — drives precise waker dispatch.
+    modified: Vec<&'static str>,
+    /// Current process PID for kernel operations.
+    pid: Pid,
+    /// Deferred: process exit requested. Executed after registry lock is released.
+    exit_requested: Option<u64>,
+}
+
+impl<'a> StoreAccessor<'a> {
+    /// Read a typed value from the store's data.
+    pub fn get<T: oboos_api::StoreValue>(&self, field: &str) -> Result<T, StoreError> {
+        let value = self.data.get(field).ok_or(StoreError::UnknownField)?;
+        T::from_value(value).ok_or(StoreError::TypeMismatch)
+    }
+
+    /// Write a typed value to the store's data with schema validation.
+    pub fn set<T: oboos_api::StoreValue>(&mut self, field: &str, value: T) -> Result<(), StoreError> {
+        let field_def = self.fields.iter()
+            .find(|f| f.name == field)
+            .ok_or(StoreError::UnknownField)?;
+        let val = value.into_value();
+        if !val.matches(&field_def.kind) {
+            return Err(StoreError::TypeMismatch);
+        }
+        let static_name: &'static str = field_def.name;
+        self.data.insert(String::from(field), val);
+        if !self.modified.contains(&static_name) {
+            self.modified.push(static_name);
+        }
+        Ok(())
+    }
+
+    /// Push a typed value onto a Queue or List field.
+    pub fn push<T: oboos_api::StoreValue>(&mut self, field: &str, value: T) -> Result<(), StoreError> {
+        let field_def = self.fields.iter()
+            .find(|f| f.name == field)
+            .ok_or(StoreError::UnknownField)?;
+        let inner_kind = match &field_def.kind {
+            FieldKind::Queue(inner) | FieldKind::List(inner) => *inner,
+            _ => return Err(StoreError::TypeMismatch),
+        };
+        let val = value.into_value();
+        if !val.matches(inner_kind) {
+            return Err(StoreError::TypeMismatch);
+        }
+        let static_name: &'static str = field_def.name;
+        match self.data.get_mut(field) {
+            Some(Value::Queue(deque)) => deque.push_back(val),
+            Some(Value::List(vec)) => vec.push(val),
+            _ => return Err(StoreError::TypeMismatch),
+        }
+        if !self.modified.contains(&static_name) {
+            self.modified.push(static_name);
+        }
+        Ok(())
+    }
+
+    /// Allocate physical frames and map them into the process's heap region.
+    /// Returns the virtual address of the mapped region.
+    ///
+    /// Safe to call under the registry lock because it only touches the frame
+    /// allocator lock and page table writes — neither involves the store registry.
+    pub fn map_user_pages(&mut self, count: usize) -> Result<u64, StoreError> {
+        crate::process::map_heap_pages(self.pid, count)
+    }
+
+    /// Flag that the process wants to exit. The MUTATE handler will execute
+    /// the actual exit logic AFTER releasing the registry lock.
+    pub fn request_process_exit(&mut self, code: u64) {
+        self.exit_requested = Some(code);
+    }
+
+    /// The PID of the process that issued this mutation.
+    pub fn pid(&self) -> Pid {
+        self.pid
+    }
+}
+
+/// Type-erased dispatch table for store mutations.
+///
+/// Each [`Reducer`] implementation generates a monomorphized `apply` function
+/// that deserializes the mutation from raw bytes and calls the reducer. This
+/// vtable is stored in [`StoreInstance`] so the registry can dispatch mutations
+/// without knowing the concrete schema type.
+struct ReducerVtable {
+    apply: fn(
+        accessor: &mut StoreAccessor,
+        mutation_id: u8,
+        payload: &[u8],
+    ) -> Result<u64, StoreError>,
+}
+
+/// Trait for stores that support typed mutations via the MUTATE syscall.
+///
+/// The `Mutation` type defines the set of operations this store supports.
+/// `reduce()` runs atomically under the registry lock with access to the
+/// store's data and a limited set of kernel operations via [`StoreAccessor`].
+/// `deserialize()` reconstructs a typed mutation from the raw syscall bytes.
+pub trait Reducer: StoreSchema {
+    type Mutation;
+
+    fn reduce(
+        store: &mut StoreAccessor,
+        mutation: Self::Mutation,
+    ) -> Result<u64, StoreError>;
+
+    /// Deserialize a mutation from raw syscall bytes.
+    /// `mutation_id` is the variant index, `payload` is the serialized data.
+    fn deserialize(mutation_id: u8, payload: &[u8]) -> Result<Self::Mutation, StoreError>;
 }
 
 /// The global store registry — all live store instances keyed by ID.
@@ -215,6 +344,7 @@ fn create_inner<S: StoreSchema>(defaults: &[(&str, Value)]) -> Result<StoreId, S
             // on the hot path.
             subscribers: Vec::with_capacity(8),
             watchers: Vec::new(),
+            reducer: None,
         },
     );
     Ok(StoreId(id))
@@ -674,4 +804,126 @@ pub fn watch(
             core::task::Poll::Ready(Err(StoreError::NotFound))
         }
     })
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// Mutation dispatch
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Register a reducer for a store, enabling MUTATE syscalls on it.
+///
+/// Must be called after the store is created but before any mutations are
+/// dispatched. The `S` type parameter must match the schema the store was
+/// created with — no runtime check is performed.
+pub fn register_reducer<S: Reducer>(store: StoreId) -> Result<(), StoreError> {
+    Arch::disable_interrupts();
+    let result = register_reducer_inner::<S>(store);
+    Arch::enable_interrupts();
+    result
+}
+
+fn register_reducer_inner<S: Reducer>(store: StoreId) -> Result<(), StoreError> {
+    let mut reg = registry().lock();
+    let instance = reg.stores.get_mut(&store.0).ok_or(StoreError::NotFound)?;
+
+    // Build the monomorphized apply function for this Reducer.
+    fn apply_fn<S: Reducer>(
+        accessor: &mut StoreAccessor,
+        mutation_id: u8,
+        payload: &[u8],
+    ) -> Result<u64, StoreError> {
+        let mutation = S::deserialize(mutation_id, payload)?;
+        S::reduce(accessor, mutation)
+    }
+
+    instance.reducer = Some(ReducerVtable { apply: apply_fn::<S> });
+    Ok(())
+}
+
+/// Result of a mutation dispatch, including deferred side-effects.
+pub struct MutateResult {
+    /// The mutation's return value (e.g. virtual address for MapHeap).
+    pub value: u64,
+    /// If set, the process requested exit with this code. The caller must
+    /// handle process exit after releasing any locks.
+    pub exit_requested: Option<u64>,
+}
+
+/// Dispatch a mutation on a store (interrupt-safe version).
+pub fn mutate(
+    store: StoreId,
+    pid: Pid,
+    mutation_id: u8,
+    payload: &[u8],
+) -> Result<MutateResult, StoreError> {
+    Arch::disable_interrupts();
+    let result = mutate_inner(store, pid, mutation_id, payload);
+    Arch::enable_interrupts();
+    result
+}
+
+/// Dispatch a mutation without touching the interrupt flag (syscall path).
+pub(crate) fn mutate_no_cli(
+    store: StoreId,
+    pid: Pid,
+    mutation_id: u8,
+    payload: &[u8],
+) -> Result<MutateResult, StoreError> {
+    mutate_inner(store, pid, mutation_id, payload)
+}
+
+fn mutate_inner(
+    store: StoreId,
+    pid: Pid,
+    mutation_id: u8,
+    payload: &[u8],
+) -> Result<MutateResult, StoreError> {
+    // Run the reducer under the registry lock, then fire wakers after releasing.
+    let (value, exit_requested, wakers) = {
+        let mut reg = registry().lock();
+        let instance = reg.stores.get_mut(&store.0).ok_or(StoreError::NotFound)?;
+
+        let apply = instance.reducer.as_ref()
+            .ok_or(StoreError::InvalidArg)?
+            .apply;
+
+        let mut accessor = StoreAccessor {
+            data: &mut instance.data,
+            fields: instance.fields,
+            modified: Vec::new(),
+            pid,
+            exit_requested: None,
+        };
+
+        let value = apply(&mut accessor, mutation_id, payload)?;
+        let exit_requested = accessor.exit_requested;
+        let modified = accessor.modified;
+
+        // Collect wakers for modified fields — same pattern as set_inner.
+        let mut wakers = Vec::new();
+        if !modified.is_empty() {
+            let mut i = 0;
+            while i < instance.subscribers.len() {
+                let sub_fields = &instance.subscribers[i].fields;
+                if modified.iter().any(|&m| sub_fields.contains(&m)) {
+                    wakers.push(instance.subscribers.swap_remove(i).waker);
+                } else {
+                    i += 1;
+                }
+            }
+            for watcher in &instance.watchers {
+                if modified.contains(&watcher.field) {
+                    wakers.push(watcher.waker.clone());
+                }
+            }
+        }
+
+        (value, exit_requested, wakers)
+    }; // registry lock dropped here
+
+    for w in wakers {
+        w.wake();
+    }
+
+    Ok(MutateResult { value, exit_requested })
 }

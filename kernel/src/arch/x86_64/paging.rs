@@ -331,6 +331,18 @@ pub fn unmap_page(virt: usize) {
     super::smp::tlb_shootdown(virt);
 }
 
+/// Check whether a virtual address has a present leaf mapping.
+///
+/// Walks the page table hierarchy without allocating. Returns `true` if all
+/// four levels are present and the leaf PTE is marked present, `false`
+/// otherwise. Used by [`grow_stack`](crate::process::grow_stack) as a safety
+/// net before calling [`map_page`] (which panics on double-map).
+pub fn is_page_mapped(virt: usize) -> bool {
+    walk_existing(virt)
+        .map(|pt| pt.entries[pt_index(virt)].is_present())
+        .unwrap_or(false)
+}
+
 /// Ensure a device MMIO physical address is mapped through the HHDM.
 ///
 /// Limine's HHDM covers RAM regions from the memory map, but not necessarily

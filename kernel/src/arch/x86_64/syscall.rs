@@ -20,15 +20,16 @@
 //!
 //! ## Syscall interface
 //!
-//! Five syscalls express all kernel interaction through the store:
+//! Six syscalls express all kernel interaction through the store:
 //!
-//! | # | Name            | Args                                               | Returns            |
-//! |---|-----------------|----------------------------------------------------|--------------------|
-//! | 0 | SYS_STORE_GET   | store_id, fields_ptr, fields_len, out_ptr, out_len | bytes written      |
-//! | 1 | SYS_STORE_SET   | store_id, buf_ptr, buf_len, 0, 0                   | 0 on success       |
-//! | 2 | SYS_SUBSCRIBE   | store_id, field_ptr, field_len, 0, 0               | sub_id (0-63)      |
-//! | 3 | SYS_UNSUBSCRIBE | sub_id, 0, 0, 0, 0                                | 0 on success       |
-//! | 4 | SYS_YIELD       | 0, 0, 0, 0, 0                                     | fired bitmask      |
+//! | # | Name            | Args                                                    | Returns            |
+//! |---|-----------------|----------------------------------------------------------|--------------------|
+//! | 0 | SYS_STORE_GET   | store_id, fields_ptr, fields_len, out_ptr, out_len      | bytes written      |
+//! | 1 | SYS_STORE_SET   | store_id, buf_ptr, buf_len, 0, 0                        | 0 on success       |
+//! | 2 | SYS_SUBSCRIBE   | store_id, field_ptr, field_len, 0, 0                    | sub_id (0-63)      |
+//! | 3 | SYS_UNSUBSCRIBE | sub_id, 0, 0, 0, 0                                     | 0 on success       |
+//! | 4 | SYS_YIELD       | 0, 0, 0, 0, 0                                          | fired bitmask      |
+//! | 5 | SYS_STORE_MUTATE| store_id, mutation_id, payload_ptr, payload_len, 0      | mutation-specific   |
 //!
 //! GET and SET use packed buffers for multi-field operations. Each field
 //! name or value is prefixed with a `u16` length. SUBSCRIBE registers a
@@ -48,9 +49,11 @@
 //! driver is one such task — it watches `CONSOLE`/`"output"` (a Queue(Str)
 //! field) and drains messages to serial.
 //!
-//! The only synchronous side-effect left is process exit: when SET writes
-//! `"status"` = `"exiting"` on the process store, the kernel reads `exit_code`,
-//! triggers process exit, and longjmps back to [`jump_to_ring3`]'s caller.
+//! Process exit and heap allocation are expressed as MUTATE operations on
+//! the process store, not as side-effects of SET. The process store's
+//! reducer runs atomically under the registry lock; deferred effects like
+//! process exit (longjmp back to [`jump_to_ring3`]'s caller) happen after
+//! the lock is released.
 //!
 //! ## Register convention
 //!
@@ -111,6 +114,7 @@ const SYS_STORE_SET: u64 = 1;
 const SYS_SUBSCRIBE: u64 = 2;
 const SYS_UNSUBSCRIBE: u64 = 3;
 const SYS_YIELD: u64 = 4;
+const SYS_STORE_MUTATE: u64 = 5;
 
 // ————————————————————————————————————————————————————————————————————————————
 // Well-known store IDs
@@ -444,10 +448,9 @@ unsafe extern "C" fn syscall_entry() {
 /// Called from [`syscall_entry`] with interrupts disabled (FMASK clears IF).
 /// Arguments arrive in System V order after the entry stub's register shuffle.
 ///
-/// Five syscalls: GET, SET, SUBSCRIBE, UNSUBSCRIBE, YIELD. Everything
-/// (process identity, console output, console input, process exit) is
-/// expressed through well-known store IDs and side-effects triggered by
-/// specific field writes.
+/// Six syscalls: GET, SET, SUBSCRIBE, UNSUBSCRIBE, YIELD, MUTATE. Everything
+/// (process identity, console output, console input, process exit, heap
+/// allocation) is expressed through well-known store IDs and mutations.
 extern "C" fn syscall_handler(
     number: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
 ) -> u64 {
@@ -457,6 +460,7 @@ extern "C" fn syscall_handler(
         SYS_SUBSCRIBE => handle_subscribe(arg1, arg2, arg3),
         SYS_UNSUBSCRIBE => handle_unsubscribe(arg1),
         SYS_YIELD => handle_yield(),
+        SYS_STORE_MUTATE => handle_store_mutate(arg1, arg2, arg3, arg4),
         _ => {
             crate::println!("[syscall] unknown: {}", number);
             oboos_api::ERR_INVALID_ARG
@@ -810,7 +814,6 @@ fn handle_store_set(
 
     // Separate queue pushes from scalar sets.
     let mut scalar_updates: Vec<(&str, Value)> = Vec::new();
-    let mut has_status_exiting = false;
 
     for entry in &entries {
         let kind = match store::field_kind_no_cli(id, entry.name) {
@@ -833,9 +836,6 @@ fn handle_store_set(
                     Some(v) => v,
                     None => return oboos_api::ERR_TYPE_MISMATCH,
                 };
-                if entry.name == "status" && entry.value_bytes == b"exiting" {
-                    has_status_exiting = true;
-                }
                 scalar_updates.push((entry.name, value));
             }
         }
@@ -848,23 +848,6 @@ fn handle_store_set(
         }
     }
 
-    // ── Side-effects ──────────────────────────────────────────────────
-
-    // Process exit: if this batch wrote status="exiting" on the process store.
-    if has_status_exiting {
-        let pid = process::current_pid();
-        if let Some(proc_store) = process::store_id(pid) {
-            if proc_store == id {
-                let exit_code = match store::get_no_cli(id, "exit_code") {
-                    Ok(Value::U64(v)) => v,
-                    _ => 0,
-                };
-                process::exit(pid, exit_code);
-                unsafe { restore_return_context(); }
-            }
-        }
-    }
-
     // Run async tasks so subscribers (like the console driver) can
     // process the new data before we return to userspace. poll_once()
     // manages its own interrupt state and returns with IF=1, so we
@@ -873,6 +856,59 @@ fn handle_store_set(
     crate::arch::Arch::disable_interrupts();
 
     0
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// SYS_STORE_MUTATE — typed mutation dispatch
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Handle SYS_STORE_MUTATE (syscall 5).
+///
+/// Dispatches a typed mutation to the store's registered reducer. The reducer
+/// runs atomically under the registry lock. Deferred side-effects (like
+/// process exit) are handled after the lock is released.
+///
+/// Args: store_id, mutation_id, payload_ptr, payload_len.
+/// Returns: mutation-specific u64 result, or error code.
+fn handle_store_mutate(
+    store_id_raw: u64, mutation_id: u64, payload_ptr: u64, payload_len: u64,
+) -> u64 {
+    if payload_len > 0 && !validate_user_ptr(payload_ptr, payload_len) {
+        return oboos_api::ERR_INVALID_ARG;
+    }
+
+    let id = match resolve_store_id(store_id_raw) {
+        Some(id) => id,
+        None => return oboos_api::ERR_NOT_FOUND,
+    };
+
+    let payload = if payload_len > 0 {
+        unsafe {
+            core::slice::from_raw_parts(payload_ptr as *const u8, payload_len as usize)
+        }
+    } else {
+        &[]
+    };
+
+    let pid = process::current_pid();
+
+    match store::mutate_no_cli(id, pid, mutation_id as u8, payload) {
+        Ok(result) => {
+            // Run async tasks so watchers react before we return.
+            crate::executor::poll_once();
+            crate::arch::Arch::disable_interrupts();
+
+            // Handle deferred process exit — must happen after registry lock
+            // is released and wakers have fired.
+            if let Some(_code) = result.exit_requested {
+                process::exit(pid, _code);
+                unsafe { restore_return_context(); }
+            }
+
+            result.value
+        }
+        Err(e) => map_store_error(&e),
+    }
 }
 
 // ————————————————————————————————————————————————————————————————————————————
