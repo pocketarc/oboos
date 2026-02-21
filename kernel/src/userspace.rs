@@ -135,44 +135,49 @@ impl StoreSchema for UserTestSchema {
 
 /// Run the Ring 3 store round-trip test with process lifecycle tracking.
 ///
-/// 1. Spawn a process (creates PID + process store)
-/// 2. Load the userspace ELF binary
-/// 3. Allocate user stack and syscall kernel stack
-/// 4. Create the application data store with `counter = 0`
-/// 5. Set the current process and start it
-/// 6. Drop to Ring 3, passing the data store ID
-/// 7. The user program sets counter=42 and exits (SYS_EXIT sets process status)
-/// 8. Verify data store (counter=42) and process store (status=exited)
-/// 9. Clean up everything
+/// 1. Allocate kernel stack (ensures PML4[506] exists before copying)
+/// 2. Spawn a process (creates PID + process store + user page table)
+/// 3. Switch to process CR3
+/// 4. Load the userspace ELF binary (maps into process page table)
+/// 5. Map initial user stack page (maps into process page table)
+/// 6. Create stores, spawn drivers, set current, start, drop to Ring 3
+/// 7. The user program sets counter=42 and exits
+/// 8. Verify data store and process store
+/// 9. Clean up: destroy process, unload ELF, free page table, switch back
 pub fn run_ring3_smoke_test() {
-    // ── Step 1: Spawn a process ────────────────────────────────────
-    let pid = process::spawn("hello");
-    println!("[user] Spawned process \"hello\" (pid={})", pid.as_raw());
+    use crate::arch::x86_64::paging;
 
-    // ── Step 2: Load the ELF binary ────────────────────────────────
-    let loaded = elf::load_elf(USER_ELF);
-
-    // ── Step 3: Set up the demand-paged user stack ──────────────
-    // Only pre-maps a single page; the rest are demand-paged via #PF.
-    process::init_stack(pid);
-    let user_rsp = process::USER_STACK_TOP as u64;
-
-    // ── Step 4: Allocate the syscall kernel stack ──────────────────
+    // ── Step 1: Allocate kernel stack on kernel CR3 ────────────────
+    // This must happen before spawn() so the kernel stack PML4 entry
+    // (slot 506) exists when create_user_page_table() copies entries 256–511.
     let kern_stack = alloc_kernel_stack();
     let kern_stack_rsp = kern_stack.stack_top as u64;
 
+    // ── Step 2: Spawn a process (creates user page table) ──────────
+    let pid = process::spawn("hello");
+    println!("[user] Spawned process \"hello\" (pid={})", pid.as_raw());
+
+    // ── Step 3: Switch to process CR3 ──────────────────────────────
+    let process_pml4 = process::pml4_phys(pid).expect("process pml4");
+    paging::switch_page_table(process_pml4);
+
+    // ── Step 4: Load the ELF binary (into process page table) ──────
+    let loaded = elf::load_elf(USER_ELF);
+
+    // ── Step 5: Set up the demand-paged user stack ──────────────
+    process::init_stack(pid);
+    let user_rsp = process::USER_STACK_TOP as u64;
+
+    // ── Step 6: Set up kernel stack pointers (no page table dependency)
     arch::syscall::set_kernel_rsp(kern_stack_rsp);
     unsafe {
         arch::gdt::set_rsp0(kern_stack_rsp);
     }
 
-    // ── Step 5: Create the console and application data stores ─────
+    // ── Step 7: Create the console and application data stores ─────
     let console_store_id = arch::syscall::create_console_store();
     println!("[user] Created console store (id={})", console_store_id.as_raw());
 
-    // Spawn the async console driver and keyboard input driver, then
-    // do an initial poll so their watch() calls register subscribers
-    // before userspace starts writing.
     executor::spawn(arch::syscall::console_driver());
     executor::spawn(arch::syscall::keyboard_input_driver());
 
@@ -182,16 +187,11 @@ pub fn run_ring3_smoke_test() {
 
     println!("[user] Created test store (id={}, counter=0)", data_store_id.as_raw());
 
-    // ── Step 6: Set current process and start it ───────────────────
+    // ── Step 8: Set current process and start it ───────────────────
     process::set_current(pid);
     process::start(pid);
 
-    // ── Step 7: Drop to Ring 3 ─────────────────────────────────────
-    //
-    // The hello program uses SYS_SUBSCRIBE/SYS_YIELD for keyboard input.
-    // During smoke tests, pre-fill the keyboard buffer with "hi\n"
-    // scancodes. The keyboard_input_driver async task converts them to
-    // ASCII and pushes them into the console store's input queue.
+    // ── Step 9: Drop to Ring 3 ─────────────────────────────────────
     #[cfg(feature = "smoke-test")]
     {
         arch::Arch::disable_interrupts();
@@ -201,8 +201,6 @@ pub fn run_ring3_smoke_test() {
         arch::Arch::enable_interrupts();
     }
 
-    // Initial poll drains any pre-filled scancodes through the input
-    // driver into the console store's input queue.
     executor::poll_once();
 
     println!("[user] Jumping to Ring 3...");
@@ -212,16 +210,14 @@ pub fn run_ring3_smoke_test() {
     }
     arch::keyboard::set_console_mode(false);
 
-    // ── Step 8: Back from Ring 3 — clean up subscriptions and verify ─
+    // ── Step 10: Back from Ring 3 — verify ─────────────────────────
     arch::syscall::clear_all_subscriptions();
     process::clear_current();
 
-    // Verify the data store was modified by userspace.
     let counter = store::get(data_store_id, "counter").expect("get counter after Ring 3");
     assert_eq!(counter, Value::U64(42), "expected counter=42, got {:?}", counter);
     println!("[ok] Ring 3 store round-trip verified (counter=42)");
 
-    // Verify the process store reflects the exit.
     let proc_store_id = process::store_id(pid).expect("process store should exist");
     let status = store::get(proc_store_id, "status").expect("get process status");
     let exit_code = store::get(proc_store_id, "exit_code").expect("get process exit_code");
@@ -231,12 +227,16 @@ pub fn run_ring3_smoke_test() {
         "expected exit_code=0, got {:?}", exit_code);
     println!("[ok] Process store verified (status=exited, exit_code=0)");
 
-    // ── Step 9: Clean up ───────────────────────────────────────────
-    // Stack frames are freed automatically by process::destroy().
+    // ── Step 11: Clean up ──────────────────────────────────────────
+    // Order matters: destroy process (unmaps stack+heap with process CR3
+    // still loaded), unload ELF, free page table frames, switch back to
+    // kernel, then free kernel stack (shared upper half).
     arch::syscall::destroy_console_store(console_store_id);
     store::destroy(data_store_id).expect("destroy user test store");
-    process::destroy(pid);
+    let pml4_phys = process::destroy(pid);
     loaded.unload();
+    paging::destroy_user_page_table(pml4_phys);
+    paging::switch_page_table(paging::kernel_pml4());
     free_kernel_stack(kern_stack);
 }
 
@@ -246,19 +246,26 @@ pub fn run_ring3_smoke_test() {
 /// runs the program, prints the exit status, and cleans up. Keyboard
 /// input is live (no pre-filled scancodes).
 pub fn run_hello_interactive() {
+    use crate::arch::x86_64::paging;
+
     // Disable interrupts while we set up (same pattern as the smoke test).
     arch::Arch::disable_interrupts();
 
+    // Allocate kernel stack before spawn so PML4[506] exists for copying.
+    let kern_stack = alloc_kernel_stack();
+    let kern_stack_rsp = kern_stack.stack_top as u64;
+
     let pid = process::spawn("hello");
     println!("[user] Spawned process \"hello\" (pid={})", pid.as_raw());
+
+    // Switch to process CR3 before loading ELF and mapping user stack.
+    let process_pml4 = process::pml4_phys(pid).expect("process pml4");
+    paging::switch_page_table(process_pml4);
 
     let loaded = elf::load_elf(USER_ELF);
 
     process::init_stack(pid);
     let user_rsp = process::USER_STACK_TOP as u64;
-
-    let kern_stack = alloc_kernel_stack();
-    let kern_stack_rsp = kern_stack.stack_top as u64;
 
     arch::syscall::set_kernel_rsp(kern_stack_rsp);
     unsafe { arch::gdt::set_rsp0(kern_stack_rsp); }
@@ -293,10 +300,13 @@ pub fn run_hello_interactive() {
     };
     println!("[user] Process exited (code={})", exit_code);
 
-    // Clean up. Stack frames are freed automatically by process::destroy().
+    // Clean up: destroy process, unload ELF, free page table, switch
+    // back to kernel CR3, then free kernel stack.
     arch::syscall::destroy_console_store(console_store_id);
     store::destroy(data_store_id).ok();
-    process::destroy(pid);
+    let pml4_phys = process::destroy(pid);
     loaded.unload();
+    paging::destroy_user_page_table(pml4_phys);
+    paging::switch_page_table(paging::kernel_pml4());
     free_kernel_stack(kern_stack);
 }

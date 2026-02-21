@@ -14,9 +14,10 @@
 //! entry allows them.
 //!
 //! Limine has already set up page tables with the kernel mapped at
-//! `0xFFFFFFFF80000000` and the HHDM at `0xFFFF800000000000`. We modify
-//! these tables in place — no new hierarchy from scratch until Phase 2
-//! per-process address spaces.
+//! `0xFFFFFFFF80000000` and the HHDM at `0xFFFF800000000000`. Per-process
+//! page tables share the kernel half (PML4 entries 256–511) via shallow
+//! copy — the same physical PDPT/PD/PT frames are referenced from every
+//! process's PML4, so kernel mappings are automatically visible everywhere.
 
 use super::memory::phys_to_virt;
 use crate::memory::{self, FRAME_SIZE};
@@ -143,6 +144,120 @@ fn invlpg(virt: usize) {
     unsafe {
         core::arch::asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags));
     }
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// Kernel PML4 — saved at boot, used as the template for per-process tables
+// ————————————————————————————————————————————————————————————————————————————
+
+/// Physical address of the boot-time (kernel) PML4, saved by [`init()`].
+///
+/// Every per-process page table copies entries 256–511 from this PML4 so
+/// the kernel half of the address space is shared across all address spaces.
+static KERNEL_PML4: spin::Once<usize> = spin::Once::new();
+
+/// Save the current CR3 as the kernel PML4 physical address.
+///
+/// Must be called once from `kmain()` after `Arch::init()` and before any
+/// process is spawned. The saved address is used by [`create_user_page_table()`]
+/// to shallow-copy the kernel half into new page tables.
+pub fn init() {
+    KERNEL_PML4.call_once(|| read_cr3() as usize);
+    crate::println!("[ok] Kernel PML4 saved ({:#X})", kernel_pml4());
+}
+
+/// Return the physical address of the kernel (boot-time) PML4.
+pub fn kernel_pml4() -> usize {
+    *KERNEL_PML4.get().expect("paging::init() not called")
+}
+
+/// Allocate a fresh PML4 for a new process.
+///
+/// The lower half (entries 0–255, user space) starts empty. The upper half
+/// (entries 256–511, kernel space) is shallow-copied from the kernel PML4 —
+/// both page tables point to the same physical PDPT/PD/PT frames, so any
+/// kernel mapping changes at levels below PML4 are immediately visible in
+/// all address spaces.
+pub fn create_user_page_table() -> usize {
+    let frame = memory::alloc_frame().expect("out of memory allocating user PML4");
+    let new_pml4 = table_at_phys(frame as u64);
+    let kern_pml4 = table_at_phys(kernel_pml4() as u64);
+
+    // Zero the user half.
+    for i in 0..256 {
+        new_pml4.entries[i] = PageTableEntry::empty();
+    }
+
+    // Shallow-copy the kernel half — same physical intermediate tables.
+    for i in 256..512 {
+        new_pml4.entries[i] = kern_pml4.entries[i];
+    }
+
+    frame
+}
+
+/// Load a new PML4 into CR3, switching address spaces.
+///
+/// Writing CR3 implicitly flushes the entire TLB — no manual `invlpg` needed.
+///
+/// # Safety
+///
+/// `pml4_phys` must be the physical address of a valid, 4 KiB-aligned PML4
+/// whose kernel half (entries 256–511) maps the currently executing code.
+pub fn switch_page_table(pml4_phys: usize) {
+    unsafe {
+        core::arch::asm!("mov cr3, {}", in(reg) pml4_phys as u64, options(nostack, preserves_flags));
+    }
+}
+
+/// Free all intermediate page table frames in the user half of a PML4.
+///
+/// Walks entries 0–255 and recursively frees PT → PD → PDPT frames
+/// bottom-up, then frees the PML4 frame itself. Does NOT touch entries
+/// 256–511 (kernel half — those point to shared intermediate tables).
+///
+/// All leaf PTEs in the user half should already have been cleared by
+/// `unmap_page()` calls (from `process::destroy()`) before calling this.
+/// This function only frees the *intermediate* page table frames, not the
+/// data frames the leaf PTEs pointed to.
+pub fn destroy_user_page_table(pml4_phys: usize) {
+    let pml4 = table_at_phys(pml4_phys as u64);
+
+    // Walk only the user half (entries 0–255).
+    for i in 0..256 {
+        let pml4e = pml4.entries[i];
+        if !pml4e.is_present() {
+            continue;
+        }
+
+        let pdpt = table_at_phys(pml4e.physical_addr());
+        for j in 0..512 {
+            let pdpte = pdpt.entries[j];
+            if !pdpte.is_present() || pdpte.is_huge() {
+                continue;
+            }
+
+            let pd = table_at_phys(pdpte.physical_addr());
+            for k in 0..512 {
+                let pde = pd.entries[k];
+                if !pde.is_present() || pde.is_huge() {
+                    continue;
+                }
+
+                // Free the PT frame (level 1).
+                memory::free_frame(pde.physical_addr() as usize);
+            }
+
+            // Free the PD frame (level 2).
+            memory::free_frame(pdpte.physical_addr() as usize);
+        }
+
+        // Free the PDPT frame (level 3).
+        memory::free_frame(pml4e.physical_addr() as usize);
+    }
+
+    // Free the PML4 frame itself.
+    memory::free_frame(pml4_phys);
 }
 
 // ————————————————————————————————————————————————————————————————————————————

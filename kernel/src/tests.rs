@@ -44,6 +44,7 @@ pub fn run_all() {
     test_persistent_watcher();
     test_store_mutation();
     test_heap_cleanup();
+    test_per_process_page_tables();
     test_ring3();
     test_smp_bringup();
     test_cross_core_async();
@@ -1306,7 +1307,9 @@ fn test_process_lifecycle() {
     assert_eq!(store::get(sid, "exit_code").unwrap(), Value::U64(42));
 
     // Destroy — removes from table and destroys the store.
-    process::destroy(pid);
+    // Returns pml4_phys so we can free the page table frames.
+    let pml4_phys = process::destroy(pid);
+    arch::paging::destroy_user_page_table(pml4_phys);
     assert!(store::get(sid, "status").is_err(), "store should be gone after destroy");
 
     println!("[ok] Process lifecycle verified (spawn \u{2192} start \u{2192} exit \u{2192} destroy)");
@@ -1387,7 +1390,8 @@ fn test_process_store_watch() {
     assert!(WATCH_DONE2.load(Ordering::SeqCst));
     assert!(SAW_EXITED.load(Ordering::SeqCst));
 
-    process::destroy(pid);
+    let pml4_phys = process::destroy(pid);
+    arch::paging::destroy_user_page_table(pml4_phys);
     println!("[ok] Process store watch verified (status transitions observable)");
 }
 
@@ -1792,11 +1796,16 @@ fn test_store_mutation() {
 /// Verify that heap pages are cleaned up when a process is destroyed.
 ///
 /// Spawns a process, allocates heap pages, then destroys the process and
-/// verifies the data frames are freed. Page table frames allocated by
-/// `map_page()` for intermediate levels are not freed (no page table
-/// reclamation yet), so we check that at least the data frames come back.
+/// verifies the data frames are freed. `destroy_user_page_table()` frees
+/// intermediate page table frames, so we count those too.
 fn test_heap_cleanup() {
+    use crate::arch::x86_64::paging;
+
     let pid = process::spawn("heap-test");
+
+    // Switch to process CR3 so map_heap_pages writes into the right page table.
+    let process_pml4 = process::pml4_phys(pid).expect("process pml4");
+    paging::switch_page_table(process_pml4);
 
     // Allocate 4 heap pages via the process heap API.
     let addr = process::map_heap_pages(pid, 4).expect("map 4 heap pages");
@@ -1810,8 +1819,12 @@ fn test_heap_cleanup() {
     // Record free frames before destroy.
     let free_before_destroy = memory::free_frame_count();
 
-    // Destroy the process — should free all 6 heap data frames + the store.
-    process::destroy(pid);
+    // Destroy the process — frees heap data frames + unmap + store.
+    let pml4_phys = process::destroy(pid);
+
+    // Free intermediate page table frames, then switch back to kernel CR3.
+    paging::destroy_user_page_table(pml4_phys);
+    paging::switch_page_table(paging::kernel_pml4());
 
     let free_after_destroy = memory::free_frame_count();
     let freed = free_after_destroy - free_before_destroy;
@@ -1822,6 +1835,48 @@ fn test_heap_cleanup() {
     );
 
     println!("[ok] Heap cleanup verified ({} frames freed on process destroy)", freed);
+}
+
+/// Verify per-process page tables: each process gets an isolated user half
+/// while sharing the kernel half with the boot page table.
+fn test_per_process_page_tables() {
+    use crate::arch::x86_64::paging;
+
+    let kern_pml4 = paging::kernel_pml4();
+
+    let pid = process::spawn("pt-test");
+    let proc_pml4 = process::pml4_phys(pid).expect("process pml4");
+
+    // The process PML4 must be a different physical frame than the kernel's.
+    assert_ne!(proc_pml4, kern_pml4, "process PML4 should differ from kernel PML4");
+
+    // Kernel half entries (256–511) should be identical — shallow copy.
+    // Check a few well-known slots: 256 (HHDM), 511 (kernel code).
+    let kern_table = unsafe { &*((crate::arch::x86_64::memory::phys_to_virt(kern_pml4 as u64)) as *const [u64; 512]) };
+    let proc_table = unsafe { &*((crate::arch::x86_64::memory::phys_to_virt(proc_pml4 as u64)) as *const [u64; 512]) };
+
+    assert_eq!(kern_table[256], proc_table[256], "PML4[256] (HHDM) should be shared");
+    assert_eq!(kern_table[511], proc_table[511], "PML4[511] (kernel code) should be shared");
+
+    // User half (0–255) should start empty.
+    for i in 0..256 {
+        assert_eq!(proc_table[i], 0, "PML4[{}] should be empty in new process", i);
+    }
+
+    // Record free frames, destroy, verify page table frame is freed.
+    let free_before = memory::free_frame_count();
+    let pml4_phys = process::destroy(pid);
+    paging::destroy_user_page_table(pml4_phys);
+    let free_after = memory::free_frame_count();
+
+    // At minimum the PML4 frame itself should be freed (1 frame).
+    // No user-half intermediate tables were created, so exactly 1.
+    assert!(
+        free_after > free_before,
+        "expected frames freed after page table destroy"
+    );
+
+    println!("[ok] Per-process page tables verified (isolation + shared kernel half)");
 }
 
 /// Verify the Ring 3 store round trip: load an ELF, drop to user mode,

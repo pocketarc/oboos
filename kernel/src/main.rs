@@ -126,6 +126,10 @@ extern "C" fn kmain() -> ! {
     // Initialize the platform (serial port, GDT, IDT, PIC, memory, PIT).
     let _platform = arch::Arch::init();
 
+    // Save the boot CR3 as the kernel PML4 — used as the template when
+    // creating per-process page tables.
+    arch::paging::init();
+
     // Initialize the kernel heap — unlocks Vec, Box, String, etc.
     heap::init();
 

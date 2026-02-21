@@ -128,6 +128,8 @@ struct Process {
     name: &'static str,
     state: ProcessState,
     store_id: StoreId,
+    /// Physical address of this process's PML4 (root page table).
+    pml4_phys: usize,
     stack: ProcessStack,
     heap: ProcessHeap,
 }
@@ -222,12 +224,15 @@ pub fn spawn(name: &'static str) -> Pid {
     store::register_reducer::<ProcessStoreSchema>(store_id)
         .expect("register process store reducer");
 
+    let pml4_phys = crate::arch::x86_64::paging::create_user_page_table();
+
     let pid = Pid(pid_raw);
     let process = Process {
         pid,
         name,
         state: ProcessState::Created,
         store_id,
+        pml4_phys,
         stack: ProcessStack {
             top: USER_STACK_TOP,
             bottom: USER_STACK_BOTTOM,
@@ -306,6 +311,12 @@ pub fn clear_current() {
 pub fn store_id(pid: Pid) -> Option<StoreId> {
     let pt = table().lock();
     pt.processes.get(&pid.0).map(|p| p.store_id)
+}
+
+/// Look up the PML4 physical address for a process's page table.
+pub fn pml4_phys(pid: Pid) -> Option<usize> {
+    let pt = table().lock();
+    pt.processes.get(&pid.0).map(|p| p.pml4_phys)
 }
 
 /// Map the initial top page of the user stack for a newly spawned process.
@@ -390,14 +401,18 @@ pub fn grow_stack(fault_addr: usize) -> Result<(), &'static str> {
 /// Remove a process from the table, free its stack and heap, and destroy its
 /// process store.
 ///
+/// Returns the physical address of the process's PML4 so the caller can
+/// free intermediate page table frames via [`paging::destroy_user_page_table()`]
+/// after switching back to the kernel CR3.
+///
 /// Call this after reading the exit status — the process store becomes
 /// inaccessible after destruction.
-pub fn destroy(pid: Pid) {
-    let (store_id, stack, heap) = {
+pub fn destroy(pid: Pid) -> usize {
+    let (store_id, pml4_phys, stack, heap) = {
         let mut pt = table().lock();
         let proc = pt.processes.remove(&pid.0)
             .expect("destroy: process not found");
-        (proc.store_id, proc.stack, proc.heap)
+        (proc.store_id, proc.pml4_phys, proc.stack, proc.heap)
     };
 
     // Unmap and free all demand-paged stack pages.
@@ -414,6 +429,8 @@ pub fn destroy(pid: Pid) {
     }
 
     store::destroy(store_id).expect("destroy process store");
+
+    pml4_phys
 }
 
 // ————————————————————————————————————————————————————————————————————————————
