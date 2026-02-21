@@ -109,12 +109,17 @@ const USER_STACK_GUARD: usize = USER_STACK_BOTTOM - FRAME_SIZE;
 
 /// Tracks the virtual address range and physical frames of a process's heap,
 /// grown incrementally via the `MapHeap` mutation.
+///
+/// Frames are demand-paged: [`map_heap_pages()`] only bumps `next_virt`,
+/// and the page fault handler fills in frames via [`grow_heap()`] when
+/// userspace first touches each page.
 struct ProcessHeap {
     /// Next virtual address to map at. Starts at [`HEAP_REGION_START`] and
     /// advances by `count * 4096` on each allocation.
     next_virt: usize,
-    /// Physical frames backing the heap — collected here for cleanup on exit.
-    frames: Vec<usize>,
+    /// Physical frames backing the heap — `(virt, phys)` pairs, collected
+    /// for cleanup on exit. Same pattern as [`ProcessStack::frames`].
+    frames: Vec<(usize, usize)>,
 }
 
 /// Start of the userspace heap region. Grows upward via MUTATE/MapHeap.
@@ -421,11 +426,10 @@ pub fn destroy(pid: Pid) -> usize {
         memory::free_frame(phys);
     }
 
-    // Unmap and free all heap pages.
-    for (i, &frame) in heap.frames.iter().enumerate() {
-        let virt = HEAP_REGION_START + i * FRAME_SIZE;
+    // Unmap and free all demand-paged heap pages.
+    for &(virt, phys) in &heap.frames {
         arch::Arch::unmap_page(virt);
-        memory::free_frame(frame);
+        memory::free_frame(phys);
     }
 
     store::destroy(store_id).expect("destroy process store");
@@ -437,15 +441,18 @@ pub fn destroy(pid: Pid) -> usize {
 // Heap page mapping
 // ————————————————————————————————————————————————————————————————————————————
 
-/// Allocate physical frames and map them into the process's heap region.
+/// Claim virtual address space for the process's heap region.
 ///
-/// Returns the virtual address of the start of the newly mapped region.
+/// Returns the virtual address of the start of the newly claimed region.
+/// No physical frames are allocated — pages are demand-paged by the #PF
+/// handler via [`grow_heap()`] when userspace first touches them.
+///
 /// Called from [`StoreAccessor::map_user_pages`] inside a MUTATE reducer.
 ///
-/// Lock ordering: only touches the frame allocator and page tables — never
-/// acquires the store registry lock (which the caller already holds).
+/// Lock ordering: only touches the process table — never acquires the
+/// store registry lock (which the caller already holds).
 pub fn map_heap_pages(pid: Pid, count: usize) -> Result<u64, StoreError> {
-    if count == 0 || count > 256 {
+    if count == 0 {
         return Err(StoreError::InvalidArg);
     }
 
@@ -453,28 +460,59 @@ pub fn map_heap_pages(pid: Pid, count: usize) -> Result<u64, StoreError> {
     let proc = pt.processes.get_mut(&pid.0).ok_or(StoreError::NotFound)?;
 
     let start_virt = proc.heap.next_virt;
-    let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER | PageFlags::NO_EXECUTE;
-
-    for i in 0..count {
-        let frame = memory::alloc_frame().ok_or(StoreError::InvalidArg)?;
-        let virt = proc.heap.next_virt;
-        arch::Arch::map_page(virt, frame, flags);
-
-        // Zero the page so userspace doesn't see stale kernel data.
-        unsafe {
-            core::ptr::write_bytes(virt as *mut u8, 0, FRAME_SIZE);
-        }
-
-        proc.heap.frames.push(frame);
-        proc.heap.next_virt += FRAME_SIZE;
-
-        // If allocation fails partway, the already-mapped pages remain and
-        // will be cleaned up when the process exits. This is simpler than
-        // trying to roll back and matches how sbrk() works on real systems.
-        let _ = i;
-    }
+    proc.heap.next_virt += count * FRAME_SIZE;
 
     Ok(start_virt as u64)
+}
+
+/// Demand-page a heap frame for a user-mode page fault.
+///
+/// Called from the #PF handler when the fault is a user-mode, page-not-present
+/// access within the heap region claimed by [`map_heap_pages()`]. Allocates a
+/// frame, maps it, and returns `Ok(())` so the handler can `iretq` back to
+/// retry the faulting instruction.
+///
+/// Mirrors [`grow_stack()`] — same pattern, different region.
+///
+/// # Errors
+///
+/// Returns `Err` if:
+/// - `fault_addr` is outside the claimed heap region
+/// - No physical frames available
+pub fn grow_heap(fault_addr: usize) -> Result<(), &'static str> {
+    use crate::arch::x86_64::memory::phys_to_virt;
+    use crate::arch::x86_64::paging::is_page_mapped;
+
+    let page = fault_addr & !(FRAME_SIZE - 1);
+
+    let pid = current_pid();
+    let mut pt = table().lock();
+    let proc = pt.processes.get_mut(&pid.0)
+        .ok_or("grow_heap: no current process")?;
+
+    if page < HEAP_REGION_START || page >= proc.heap.next_virt {
+        return Err("fault outside heap region");
+    }
+
+    // Safety net: if the page is somehow already mapped, return success
+    // to avoid map_page's panic on double-map.
+    if is_page_mapped(page) {
+        return Ok(());
+    }
+
+    let frame = memory::alloc_frame().ok_or("out of memory growing heap")?;
+    let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER | PageFlags::NO_EXECUTE;
+    arch::Arch::map_page(page, frame, flags);
+
+    // Zero through the HHDM — not through the user mapping.
+    unsafe {
+        core::ptr::write_bytes(phys_to_virt(frame as u64), 0, FRAME_SIZE);
+    }
+
+    proc.heap.frames.push((page, frame));
+    crate::println!("[heap] Demand-mapped page at {:#X}", page);
+
+    Ok(())
 }
 
 // ————————————————————————————————————————————————————————————————————————————

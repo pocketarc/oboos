@@ -1809,21 +1809,33 @@ fn test_heap_cleanup() {
 
     let pid = process::spawn("heap-test");
 
-    // Switch to process CR3 so map_heap_pages writes into the right page table.
+    // Switch to process CR3 so grow_heap maps into the right page table,
+    // and set current PID so grow_heap can look up the process.
     let process_pml4 = process::pml4_phys(pid).expect("process pml4");
     paging::switch_page_table(process_pml4);
+    process::set_current(pid);
 
-    // Allocate 4 heap pages via the process heap API.
+    // Claim 4 heap pages — no physical frames allocated yet (demand-paged).
     let addr = process::map_heap_pages(pid, 4).expect("map 4 heap pages");
     assert!(addr > 0, "heap address should be non-zero");
     assert_eq!(addr as usize, 0x0100_0000, "first heap alloc should start at HEAP_REGION_START");
 
-    // Allocate 2 more pages.
+    // Claim 2 more pages.
     let addr2 = process::map_heap_pages(pid, 2).expect("map 2 more heap pages");
     assert_eq!(addr2 as usize, 0x0100_0000 + 4 * 4096, "second alloc should follow first");
 
+    // Simulate page faults: manually call grow_heap for each claimed page.
+    // In real usage the #PF handler does this, but tests run in kernel mode
+    // with IF=0 so we call it directly.
+    for i in 0..6 {
+        let page_addr = 0x0100_0000 + i * 4096;
+        process::grow_heap(page_addr).expect("grow_heap should succeed");
+    }
+
     // Record free frames before destroy.
     let free_before_destroy = memory::free_frame_count();
+
+    process::clear_current();
 
     // Destroy the process — frees heap data frames + unmap + store.
     let pml4_phys = process::destroy(pid);
