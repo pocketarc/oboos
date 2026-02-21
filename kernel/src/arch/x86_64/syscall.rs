@@ -89,7 +89,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{RawWaker, RawWakerVTable, Waker};
 
 use crate::platform::{Platform, SerialConsole};
-use crate::process;
+use crate::process::{self, Pid};
 use crate::store::{self, StoreError, StoreId};
 use oboos_api::{FieldDef, FieldKind, StoreSchema, Value};
 
@@ -868,9 +868,10 @@ fn handle_store_mutate(
 // Subscription tracking (SYS_SUBSCRIBE / SYS_UNSUBSCRIBE / SYS_YIELD)
 // ————————————————————————————————————————————————————————————————————————————
 
-/// Tracks which store each subscription slot belongs to.
+/// Tracks which store and process each subscription slot belongs to.
 struct SubscriptionSlot {
     store: StoreId,
+    pid: Pid,
 }
 
 /// 64 subscription slots, one per bit in [`FIRED_MASK`].
@@ -936,7 +937,10 @@ fn handle_subscribe(store_id_raw: u64, field_ptr: u64, field_len: u64) -> u64 {
     let waker = subscription_waker(sub_id);
     match store::add_watcher_no_cli(id, field_name, waker, sub_id) {
         Ok(fire_immediately) => {
-            subs[sub_id as usize] = Some(SubscriptionSlot { store: id });
+            subs[sub_id as usize] = Some(SubscriptionSlot {
+                store: id,
+                pid: process::current_pid(),
+            });
             if fire_immediately {
                 FIRED_MASK.fetch_or(1 << sub_id, Ordering::SeqCst);
             }
@@ -974,29 +978,66 @@ fn handle_unsubscribe(sub_id: u64) -> u64 {
 /// [`poll_once()`] while waiting. Preemption is suppressed so PIT
 /// ticks don't context-switch us off the syscall kernel stack.
 fn handle_yield() -> u64 {
+    let pid = process::current_pid();
     crate::scheduler::disable_preemption();
     loop {
-        let mask = FIRED_MASK.swap(0, Ordering::SeqCst);
-        if mask != 0 {
-            crate::scheduler::enable_preemption();
-            crate::arch::Arch::disable_interrupts();
-            return mask;
+        // Atomically take the full fired mask, then split it into bits
+        // belonging to this process vs. other processes.
+        let full_mask = FIRED_MASK.swap(0, Ordering::SeqCst);
+        if full_mask != 0 {
+            let my_mask = filter_mask_by_pid(full_mask, pid);
+            let other_mask = full_mask & !my_mask;
+
+            // Put back bits belonging to other processes.
+            if other_mask != 0 {
+                FIRED_MASK.fetch_or(other_mask, Ordering::SeqCst);
+            }
+
+            if my_mask != 0 {
+                crate::scheduler::enable_preemption();
+                crate::arch::Arch::disable_interrupts();
+                return my_mask;
+            }
         }
         crate::executor::poll_once();
         crate::arch::Arch::halt_until_interrupt();
     }
 }
 
-/// Clear all subscriptions. Called on process exit to prevent stale
-/// watchers from firing after the process is gone.
-pub fn clear_all_subscriptions() {
-    let mut subs = SUBSCRIPTIONS.lock();
-    for i in 0..64 {
-        if let Some(slot) = subs[i].take() {
-            let _ = store::remove_watcher_no_cli(slot.store, i as u64);
+/// Return only the bits in `mask` whose subscription slots are owned by `pid`.
+fn filter_mask_by_pid(mask: u64, pid: Pid) -> u64 {
+    let subs = SUBSCRIPTIONS.lock();
+    let mut result = 0u64;
+    for bit in 0..64u64 {
+        if mask & (1 << bit) != 0 {
+            if let Some(slot) = &subs[bit as usize] {
+                if slot.pid == pid {
+                    result |= 1 << bit;
+                }
+            }
         }
     }
-    FIRED_MASK.store(0, Ordering::SeqCst);
+    result
+}
+
+/// Clear all subscriptions owned by `pid`. Called on process exit to
+/// prevent stale watchers from firing after the process is gone.
+pub fn clear_all_subscriptions(pid: Pid) {
+    let mut subs = SUBSCRIPTIONS.lock();
+    let mut clear_mask = 0u64;
+    for i in 0..64 {
+        if let Some(slot) = &subs[i] {
+            if slot.pid == pid {
+                let slot = subs[i].take().unwrap();
+                let _ = store::remove_watcher_no_cli(slot.store, i as u64);
+                clear_mask |= 1 << i;
+            }
+        }
+    }
+    // Clear only the bits belonging to this process.
+    if clear_mask != 0 {
+        FIRED_MASK.fetch_and(!clear_mask, Ordering::SeqCst);
+    }
 }
 
 /// Async keyboard input driver — reads scancodes from the keyboard

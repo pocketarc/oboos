@@ -4,7 +4,7 @@
 //! collide with valid byte counts returned by SYS_STORE_GET, since no
 //! single GET response will ever approach `u64::MAX` bytes. This lets
 //! userspace distinguish errors from success with a single threshold check:
-//! `result > ERR_THRESHOLD` means error.
+//! `result >= ERR_THRESHOLD` means error.
 //!
 //! [`StoreError`] is the Rust enum used by both the kernel and liboboos.
 //! The raw `u64` constants below are the ABI — what actually travels in
@@ -44,7 +44,7 @@ pub const ERR_THRESHOLD: u64 = u64::MAX - 15;
 /// }
 /// ```
 pub fn is_error(result: u64) -> bool {
-    result > ERR_THRESHOLD
+    result >= ERR_THRESHOLD
 }
 
 /// Errors returned by store operations.

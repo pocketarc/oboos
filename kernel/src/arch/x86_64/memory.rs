@@ -14,6 +14,8 @@
 //! [`MemoryRegion`](crate::memory::MemoryRegion) format and hands them to the
 //! frame allocator in [`crate::memory`].
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use limine::memory_map::EntryType;
 use limine::request::{HhdmRequest, MemoryMapRequest};
 
@@ -33,9 +35,9 @@ static HHDM: HhdmRequest = HhdmRequest::new();
 /// HHDM offset, set once during init. All physical memory is mapped at
 /// `virtual = physical + HHDM_OFFSET` by the bootloader's page tables.
 ///
-/// Safe to use as `static mut` because it's written exactly once during
-/// single-threaded init (interrupts disabled) and only read afterwards.
-static mut HHDM_OFFSET: u64 = 0;
+/// Atomic because `phys_to_virt` is called from all cores after SMP bringup.
+/// Written once during single-threaded init, then read-only.
+static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 /// Convert a physical address to a virtual pointer via the HHDM.
 ///
@@ -49,7 +51,7 @@ static mut HHDM_OFFSET: u64 = 0;
 /// RAM. Passing an address beyond physical memory will produce a pointer
 /// into unmapped virtual space, causing a page fault on dereference.
 pub fn phys_to_virt(phys: u64) -> *mut u8 {
-    unsafe { (phys + HHDM_OFFSET) as *mut u8 }
+    (phys + HHDM_OFFSET.load(Ordering::Relaxed)) as *mut u8
 }
 
 /// Initialize physical memory management.
@@ -68,9 +70,7 @@ pub fn init() {
         .expect("Limine did not provide HHDM response");
     let offset = hhdm_response.offset();
 
-    unsafe {
-        HHDM_OFFSET = offset;
-    }
+    HHDM_OFFSET.store(offset, Ordering::Relaxed);
     crate::println!("[mem] HHDM offset: {:#018X}", offset);
 
     // --- Memory map ---

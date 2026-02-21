@@ -123,6 +123,11 @@ const STATUS_BAR_HEIGHT: usize = 32;
 /// Kernel entry point — where the bootloader jumps to.
 #[unsafe(no_mangle)]
 extern "C" fn kmain() -> ! {
+    // Verify the bootloader speaks our protocol revision before touching
+    // any Limine responses. If this fails, response pointers may be null
+    // or malformed — better to panic here than crash deep in init.
+    assert!(BASE_REVISION.is_supported());
+
     // Initialize the platform (serial port, GDT, IDT, PIC, memory, PIT).
     let _platform = arch::Arch::init();
 
@@ -162,9 +167,6 @@ extern "C" fn kmain() -> ! {
     // Run smoke tests when built with `--features smoke-test` (via `make test`).
     #[cfg(feature = "smoke-test")]
     tests::run_all();
-
-    // Verify the bootloader speaks our protocol revision.
-    assert!(BASE_REVISION.is_supported());
 
     println!("=========================");
     println!("  OBOOS v0.0");

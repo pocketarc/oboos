@@ -213,6 +213,7 @@ pub fn wake(id: AsyncTaskId) {
 /// Returns the number of completed futures.
 pub fn poll_once() -> usize {
     let cpu = arch::smp::current_cpu() as usize;
+    let was_enabled = interrupts_enabled();
 
     // Step 1: drain the wake queue with IF=0.
     Arch::disable_interrupts();
@@ -221,7 +222,7 @@ pub fn poll_once() -> usize {
         let exec = guard.as_mut().expect("executor not initialized");
         core::mem::take(&mut exec.wake_queue)
     };
-    Arch::enable_interrupts();
+    if was_enabled { Arch::enable_interrupts(); }
 
     let mut completed = 0;
 
@@ -234,7 +235,7 @@ pub fn poll_once() -> usize {
             .expect("executor not initialized")
             .tasks
             .remove(&id);
-        Arch::enable_interrupts();
+        if was_enabled { Arch::enable_interrupts(); }
 
         let Some(mut task) = task else {
             continue;
@@ -253,7 +254,7 @@ pub fn poll_once() -> usize {
                 let exec = guard.as_mut().expect("executor not initialized");
                 exec.tasks.insert(id, task);
                 drop(guard);
-                Arch::enable_interrupts();
+                if was_enabled { Arch::enable_interrupts(); }
             }
         }
     }
@@ -283,6 +284,8 @@ fn try_steal_and_poll() {
         return;
     }
 
+    let was_enabled = interrupts_enabled();
+
     for offset in 1..count {
         let victim = ((cpu + offset) % count) as usize;
 
@@ -297,7 +300,7 @@ fn try_steal_and_poll() {
                 _ => None,
             }
         };
-        Arch::enable_interrupts();
+        if was_enabled { Arch::enable_interrupts(); }
 
         let Some(id) = stolen_id else { continue };
 
@@ -309,7 +312,7 @@ fn try_steal_and_poll() {
             .lock()
             .as_mut()
             .and_then(|exec| exec.tasks.remove(&id));
-        Arch::enable_interrupts();
+        if was_enabled { Arch::enable_interrupts(); }
 
         let Some(mut task) = stolen_task else { continue };
 
@@ -333,7 +336,7 @@ fn try_steal_and_poll() {
                     exec.tasks.insert(id, task);
                 }
                 drop(guard);
-                Arch::enable_interrupts();
+                if was_enabled { Arch::enable_interrupts(); }
             }
         }
 
@@ -365,7 +368,7 @@ pub fn run() -> ! {
 fn interrupts_enabled() -> bool {
     let rflags: u64;
     unsafe {
-        core::arch::asm!("pushfq; pop {}", out(reg) rflags, options(nomem));
+        core::arch::asm!("pushfq; pop {}", out(reg) rflags);
     }
     rflags & 0x200 != 0
 }

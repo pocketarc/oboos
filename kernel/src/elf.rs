@@ -156,7 +156,11 @@ pub fn load_elf(binary: &[u8]) -> LoadedElf {
     let entry = header.e_entry;
 
     assert!(phentsize >= core::mem::size_of::<Elf64Phdr>(), "phentsize too small");
-    assert!(phoff + phnum * phentsize <= binary.len(), "program headers extend past binary");
+    let ph_end = phnum
+        .checked_mul(phentsize)
+        .and_then(|s| s.checked_add(phoff))
+        .expect("ELF program header table size overflows usize");
+    assert!(ph_end <= binary.len(), "program headers extend past binary");
 
     println!("[elf] Loading ELF binary ({} bytes, {} program headers, entry={:#X})", binary.len(), phnum, entry);
 
@@ -176,6 +180,22 @@ pub fn load_elf(binary: &[u8]) -> LoadedElf {
         let filesz = phdr.p_filesz as usize;
         let offset = phdr.p_offset as usize;
         let flags = phdr.p_flags;
+
+        // Validate segment bounds before mapping.
+        assert!(vaddr >= 0x1000, "PT_LOAD segment maps to null page (vaddr={:#X})", vaddr);
+        let seg_end = vaddr.checked_add(memsz)
+            .expect("segment vaddr + memsz overflows usize");
+        assert!(seg_end <= 0x0000_8000_0000_0000,
+            "PT_LOAD segment overlaps kernel half (vaddr={:#X}, memsz={:#X})", vaddr, memsz);
+        assert!(memsz >= filesz,
+            "PT_LOAD segment memsz ({:#X}) < filesz ({:#X})", memsz, filesz);
+        if filesz > 0 {
+            let file_end = offset.checked_add(filesz)
+                .expect("segment offset + filesz overflows usize");
+            assert!(file_end <= binary.len(),
+                "PT_LOAD segment file data extends past binary (offset={:#X}, filesz={:#X}, binary_len={:#X})",
+                offset, filesz, binary.len());
+        }
 
         // Translate ELF segment flags to page table flags.
         // All user segments need PRESENT | USER.

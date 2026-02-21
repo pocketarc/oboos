@@ -118,7 +118,7 @@ fn schedule() {
         let mut guard = SCHEDULERS[cpu].lock();
         let sched = guard.as_mut().expect("scheduler not initialized");
 
-        if let Some(next) = sched.ready.pop_front() {
+        if let Some(next) = pop_next_ready(&mut sched.ready) {
             Some(prepare_switch(sched, cpu, next))
         } else {
             None
@@ -143,7 +143,9 @@ fn schedule() {
 }
 
 /// Swap the current task with `next`, returning raw pointers for the
-/// context switch. The old current goes to the back of the ready queue.
+/// context switch. The old current goes to the back of the ready queue
+/// unless it was Blocked (in which case it keeps its state — its waker
+/// is responsible for re-enqueuing it when the blocking condition clears).
 ///
 /// Must be called while holding the scheduler lock.
 fn prepare_switch(
@@ -152,15 +154,26 @@ fn prepare_switch(
     next: Task,
 ) -> (*mut TaskContext, *const TaskContext) {
     let mut prev = core::mem::replace(&mut sched.current, next);
-    prev.state = TaskState::Ready;
     sched.current.state = TaskState::Running;
-    sched.ready.push_back(prev);
-
     TICKS_REMAINING[cpu].store(PREEMPT_TICKS, Ordering::Relaxed);
+
+    // Only transition Running → Ready. A Blocked task keeps its state so
+    // pop_next_ready() will skip it until its waker sets it back to Ready.
+    if prev.state == TaskState::Running {
+        prev.state = TaskState::Ready;
+    }
+    sched.ready.push_back(prev);
 
     let save_to = &mut sched.ready.back_mut().unwrap().context as *mut TaskContext;
     let restore_from = &sched.current.context as *const TaskContext;
     (save_to, restore_from)
+}
+
+/// Pop the next Ready task from the front of the deque, skipping any
+/// Blocked tasks that are parked there waiting for their waker.
+fn pop_next_ready(deque: &mut VecDeque<Task>) -> Option<Task> {
+    let pos = deque.iter().position(|t| t.state == TaskState::Ready)?;
+    deque.remove(pos)
 }
 
 /// Try to steal a task from another core's ready queue.
@@ -174,7 +187,7 @@ fn try_steal(cpu: usize) -> Option<Task> {
         let target = (cpu + i) % count;
         let mut guard = SCHEDULERS[target].lock();
         if let Some(sched) = guard.as_mut() {
-            if let Some(task) = sched.ready.pop_back() {
+            if let Some(task) = pop_next_ready(&mut sched.ready) {
                 return Some(task);
             }
         }

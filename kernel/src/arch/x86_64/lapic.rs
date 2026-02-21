@@ -26,7 +26,7 @@
 //! (measured by the PIT's known 1.193182 MHz oscillator) and count how
 //! many APIC ticks elapsed. This gives us the conversion factor.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use super::memory::phys_to_virt;
 
@@ -79,12 +79,13 @@ const LAPIC_DIV_16: u32 = 0b0011;
 // ————————————————————————————————————————————————————————————————————————————
 
 /// LAPIC base virtual address, computed once from the MSR during init.
-static mut LAPIC_BASE: u64 = 0;
+/// Atomic because `read()`/`write()` are called from all cores after SMP bringup.
+static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 
 /// Calibrated APIC timer ticks per millisecond. Set during BSP init,
-/// used by all cores (the APIC timer frequency is the same across cores
-/// on the same die).
-static mut APIC_TICKS_PER_MS: u32 = 0;
+/// read by all APs during their `init_ap()`. The APIC timer frequency
+/// is the same across cores on the same die.
+static APIC_TICKS_PER_MS: AtomicU32 = AtomicU32::new(0);
 
 /// Global tick counter incremented by the BSP's APIC timer handler only.
 /// Other cores drive their own scheduling ticks but don't contribute to
@@ -93,7 +94,7 @@ pub static GLOBAL_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether APIC mode is active. Once set, IRQ handlers use `lapic::eoi()`
 /// instead of `pic::acknowledge()`.
-static mut APIC_MODE: bool = false;
+static APIC_MODE: AtomicBool = AtomicBool::new(false);
 
 // ————————————————————————————————————————————————————————————————————————————
 // Register access
@@ -101,13 +102,13 @@ static mut APIC_MODE: bool = false;
 
 /// Read a 32-bit LAPIC register.
 unsafe fn read(offset: u32) -> u32 {
-    let addr = unsafe { LAPIC_BASE + offset as u64 };
+    let addr = LAPIC_BASE.load(Ordering::Relaxed) + offset as u64;
     unsafe { core::ptr::read_volatile(addr as *const u32) }
 }
 
 /// Write a 32-bit LAPIC register.
 unsafe fn write(offset: u32, value: u32) {
-    let addr = unsafe { LAPIC_BASE + offset as u64 };
+    let addr = LAPIC_BASE.load(Ordering::Relaxed) + offset as u64;
     unsafe { core::ptr::write_volatile(addr as *mut u32, value) }
 }
 
@@ -126,18 +127,18 @@ use super::msr::rdmsr;
 /// Must be called after `pit::init()` (needs PIT for calibration) and
 /// before `ioapic::init()` (which disables the PIC).
 pub fn init() {
+    // Read LAPIC base physical address from the MSR.
+    // Bits 12..51 hold the base address (page-aligned).
+    let msr_val = unsafe { rdmsr(IA32_APIC_BASE_MSR) };
+    let phys_base = msr_val & 0x000F_FFFF_FFFF_F000;
+
+    // The LAPIC is memory-mapped MMIO, not RAM. Limine's HHDM only
+    // covers physical RAM regions, so this page may not be mapped yet.
+    super::paging::ensure_mmio_mapped(phys_base as usize);
+
+    LAPIC_BASE.store(phys_to_virt(phys_base) as u64, Ordering::Relaxed);
+
     unsafe {
-        // Read LAPIC base physical address from the MSR.
-        // Bits 12..35 hold the base address (page-aligned).
-        let msr_val = rdmsr(IA32_APIC_BASE_MSR);
-        let phys_base = msr_val & 0xFFFF_F000;
-
-        // The LAPIC is memory-mapped MMIO, not RAM. Limine's HHDM only
-        // covers physical RAM regions, so this page may not be mapped yet.
-        super::paging::ensure_mmio_mapped(phys_base as usize);
-
-        LAPIC_BASE = phys_to_virt(phys_base) as u64;
-
         // Enable the APIC via the software enable bit in the spurious
         // interrupt vector register. Also set the spurious vector.
         write(LAPIC_SPURIOUS, LAPIC_SW_ENABLE | SPURIOUS_VECTOR as u32);
@@ -149,16 +150,16 @@ pub fn init() {
 
         // Calibrate: measure APIC timer ticks in a known PIT interval.
         let ticks_per_ms = calibrate_timer();
-        APIC_TICKS_PER_MS = ticks_per_ms;
+        APIC_TICKS_PER_MS.store(ticks_per_ms, Ordering::Relaxed);
 
         crate::println!("[lapic] Calibrated: {} ticks/ms (base {:#X})",
             ticks_per_ms, phys_base);
 
         // Start the BSP's periodic timer.
         start_timer(ticks_per_ms);
-
-        APIC_MODE = true;
     }
+
+    APIC_MODE.store(true, Ordering::Relaxed);
 }
 
 /// Initialize an AP's Local APIC and start its timer.
@@ -166,13 +167,13 @@ pub fn init() {
 /// The LAPIC base address and ticks_per_ms are already known from BSP init.
 /// Each AP just needs to enable its own APIC and start its timer.
 pub fn init_ap() {
-    unsafe {
-        // Read this AP's LAPIC base from its own MSR (same physical address
-        // on all cores, but each core has its own MSR copy).
-        let msr_val = rdmsr(IA32_APIC_BASE_MSR);
-        let phys_base = msr_val & 0xFFFF_F000;
-        let base = phys_to_virt(phys_base) as u64;
+    // Read this AP's LAPIC base from its own MSR (same physical address
+    // on all cores, but each core has its own MSR copy).
+    let msr_val = unsafe { rdmsr(IA32_APIC_BASE_MSR) };
+    let phys_base = msr_val & 0x000F_FFFF_FFFF_F000;
+    let base = phys_to_virt(phys_base) as u64;
 
+    unsafe {
         // Enable APIC + set spurious vector.
         let addr = base + LAPIC_SPURIOUS as u64;
         core::ptr::write_volatile(addr as *mut u32, LAPIC_SW_ENABLE | SPURIOUS_VECTOR as u32);
@@ -182,7 +183,7 @@ pub fn init_ap() {
         core::ptr::write_volatile(addr as *mut u32, LAPIC_DIV_16);
 
         // Start periodic timer with the calibrated value.
-        let ticks_per_ms = APIC_TICKS_PER_MS;
+        let ticks_per_ms = APIC_TICKS_PER_MS.load(Ordering::Relaxed);
 
         // Program timer LVT: periodic mode, our timer vector.
         let addr = base + LAPIC_TIMER_LVT as u64;
@@ -204,7 +205,7 @@ pub fn eoi() {
 
 /// Return `true` if we've switched from PIC to APIC mode.
 pub fn is_apic_mode() -> bool {
-    unsafe { APIC_MODE }
+    APIC_MODE.load(Ordering::Relaxed)
 }
 
 /// Return elapsed milliseconds since APIC timer started (BSP only).
@@ -221,7 +222,7 @@ pub fn send_ipi(target_lapic_id: u32, vector: u8) {
         write(LAPIC_ICR_HIGH, target_lapic_id << 24);
         // ICR low: vector in bits 0-7, delivery mode fixed (000),
         // level assert (bit 14), edge trigger (bit 15 = 0).
-        write(LAPIC_ICR_LOW, vector as u32);
+        write(LAPIC_ICR_LOW, vector as u32 | (1 << 14));
     }
 }
 

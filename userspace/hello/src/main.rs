@@ -62,9 +62,9 @@ async fn main(store_id: u64) {
                 write("\n");
                 return;
             }
-            Some(Some(ch)) => {
+            Some(Some(ch)) if ch.is_ascii() => {
                 let echo = [ch];
-                let s = unsafe { core::str::from_utf8_unchecked(&echo) };
+                let s = core::str::from_utf8(&echo).unwrap();
                 write(s);
             }
             _ => {}

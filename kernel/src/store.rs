@@ -151,6 +151,10 @@ pub struct StoreAccessor<'a> {
     pid: Pid,
     /// Deferred: process exit requested. Executed after registry lock is released.
     exit_requested: Option<u64>,
+    /// Clone-on-first-write rollback map. If the reducer fails, these
+    /// original values are restored so the store is never left partially
+    /// mutated by a failed mutation.
+    rollback: BTreeMap<String, Value>,
 }
 
 impl<'a> StoreAccessor<'a> {
@@ -161,6 +165,9 @@ impl<'a> StoreAccessor<'a> {
     }
 
     /// Write a typed value to the store's data with schema validation.
+    ///
+    /// Snapshots the old value on first write so the store can rollback
+    /// if the reducer fails later.
     pub fn set<T: oboos_api::StoreValue>(&mut self, field: &str, value: T) -> Result<(), StoreError> {
         let field_def = self.fields.iter()
             .find(|f| f.name == field)
@@ -170,6 +177,12 @@ impl<'a> StoreAccessor<'a> {
             return Err(StoreError::TypeMismatch);
         }
         let static_name: &'static str = field_def.name;
+        // Clone-on-first-write: snapshot for rollback.
+        if !self.rollback.contains_key(field) {
+            if let Some(old) = self.data.get(field) {
+                self.rollback.insert(String::from(field), old.clone());
+            }
+        }
         self.data.insert(String::from(field), val);
         if !self.modified.contains(&static_name) {
             self.modified.push(static_name);
@@ -178,6 +191,9 @@ impl<'a> StoreAccessor<'a> {
     }
 
     /// Push a typed value onto a Queue or List field.
+    ///
+    /// Snapshots the old collection on first write so the store can rollback
+    /// if the reducer fails later.
     pub fn push<T: oboos_api::StoreValue>(&mut self, field: &str, value: T) -> Result<(), StoreError> {
         let field_def = self.fields.iter()
             .find(|f| f.name == field)
@@ -191,6 +207,12 @@ impl<'a> StoreAccessor<'a> {
             return Err(StoreError::TypeMismatch);
         }
         let static_name: &'static str = field_def.name;
+        // Clone-on-first-write: snapshot for rollback.
+        if !self.rollback.contains_key(field) {
+            if let Some(old) = self.data.get(field) {
+                self.rollback.insert(String::from(field), old.clone());
+            }
+        }
         match self.data.get_mut(field) {
             Some(Value::Queue(deque)) => deque.push_back(val),
             Some(Value::List(vec)) => vec.push(val),
@@ -910,9 +932,19 @@ fn mutate_inner(
             modified: Vec::new(),
             pid,
             exit_requested: None,
+            rollback: BTreeMap::new(),
         };
 
-        let value = apply(&mut accessor, mutation_id, payload)?;
+        let value = match apply(&mut accessor, mutation_id, payload) {
+            Ok(v) => v,
+            Err(e) => {
+                // Restore original values so the store isn't left partially mutated.
+                for (field, original) in accessor.rollback {
+                    accessor.data.insert(field, original);
+                }
+                return Err(e);
+            }
+        };
         let exit_requested = accessor.exit_requested;
         let modified = accessor.modified;
 

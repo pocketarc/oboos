@@ -75,6 +75,10 @@ pub trait Timer {
 pub trait MemoryManager {
     fn map_page(virt: usize, phys: usize, flags: PageFlags);
     fn unmap_page(virt: usize);
+    /// Map a page in a specific address space (explicit PML4 physical address).
+    fn map_page_at(pml4_phys: usize, virt: usize, phys: usize, flags: PageFlags);
+    /// Unmap a page in a specific address space (explicit PML4 physical address).
+    fn unmap_page_at(pml4_phys: usize, virt: usize);
     /// Allocate a physical frame — a 4 KiB-aligned page of physical RAM.
     fn alloc_physical_frame() -> Option<usize>;
     /// Return a physical frame to the free pool.

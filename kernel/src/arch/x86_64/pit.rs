@@ -16,6 +16,8 @@
 //! IRQ 0 each time it hits zero, then reloads. So:
 //! frequency = 1,193,182 / divisor. For ~1000 Hz: divisor = 1193.
 
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
 use super::port::outb;
 
 /// Channel 0 data port — write the divisor here (low byte, then high byte).
@@ -30,12 +32,14 @@ const PIT_FREQUENCY: u32 = 1_193_182;
 
 /// Total number of IRQ 0 ticks since the PIT was initialized.
 ///
-/// No locking needed: we're single-core, interrupt gates clear IF so IRQ
-/// handlers can't re-enter, and u64 reads/writes are atomic on x86_64.
-static mut TICKS: u64 = 0;
+/// Atomic because the IRQ handler increments from the BSP while other cores
+/// may read via [`elapsed_ms`]. Relaxed ordering suffices — we only need
+/// a monotonic count, not synchronization with other memory.
+static TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// The frequency we programmed, stored for [`elapsed_ms`] conversion.
-static mut FREQUENCY_HZ: u32 = 0;
+/// Written once during [`init`], read by [`elapsed_ms`] from any core.
+static FREQUENCY_HZ: AtomicU32 = AtomicU32::new(0);
 
 /// Program PIT channel 0 for periodic interrupts at `frequency_hz` Hz.
 ///
@@ -54,9 +58,9 @@ pub fn init(frequency_hz: u32) {
         outb(COMMAND, 0x36);
         outb(CHANNEL_0, divisor as u8);         // low byte
         outb(CHANNEL_0, (divisor >> 8) as u8);  // high byte
-
-        FREQUENCY_HZ = frequency_hz;
     }
+
+    FREQUENCY_HZ.store(frequency_hz, Ordering::Relaxed);
 
     let period_us = 1_000_000 / frequency_hz;
     crate::println!("[ok] PIT configured: {} Hz ({} \u{00B5}s per tick)", frequency_hz, period_us);
@@ -67,7 +71,9 @@ pub fn init(frequency_hz: u32) {
 /// At 1000 Hz this simplifies to just the tick count. No overflow concern:
 /// u64 at 1000 Hz overflows after ~584 million years.
 pub fn elapsed_ms() -> u64 {
-    unsafe { (TICKS * 1000) / FREQUENCY_HZ as u64 }
+    let ticks = TICKS.load(Ordering::Relaxed);
+    let freq = FREQUENCY_HZ.load(Ordering::Relaxed) as u64;
+    (ticks * 1000) / freq
 }
 
 /// IRQ 0 handler — called by the interrupt stub every time the PIT fires.
@@ -77,9 +83,7 @@ pub fn elapsed_ms() -> u64 {
 /// by the IRQ stub before we're called (required because we may
 /// context-switch away and not return for a while).
 pub fn tick() {
-    unsafe {
-        TICKS += 1;
-    }
+    TICKS.fetch_add(1, Ordering::Relaxed);
     crate::scheduler::on_tick();
     crate::timer::check_deadlines();
 }

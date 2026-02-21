@@ -211,7 +211,7 @@ pub fn run_ring3_smoke_test() {
     arch::keyboard::set_console_mode(false);
 
     // ── Step 10: Back from Ring 3 — verify ─────────────────────────
-    arch::syscall::clear_all_subscriptions();
+    arch::syscall::clear_all_subscriptions(pid);
     process::clear_current();
 
     let counter = store::get(data_store_id, "counter").expect("get counter after Ring 3");
@@ -289,7 +289,7 @@ pub fn run_hello_interactive() {
     }
     arch::keyboard::set_console_mode(false);
 
-    arch::syscall::clear_all_subscriptions();
+    arch::syscall::clear_all_subscriptions(pid);
     process::clear_current();
 
     // Report exit status.

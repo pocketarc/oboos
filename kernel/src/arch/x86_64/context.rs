@@ -20,27 +20,46 @@
 //! declaration, which our assembly will depend on for known offsets:
 //! `rsp` at offset 0, `rbx` at 8, `rbp` at 16, etc.
 
+/// 512-byte FXSAVE area for SSE/x87 floating-point state.
+///
+/// The `fxsave64`/`fxrstor64` instructions require 16-byte alignment.
+/// Each task gets its own `FpuState` so FPU/SSE registers are preserved
+/// across context switches — without this, any task using `f32`/`f64`
+/// or SIMD would silently corrupt another task's FPU state.
+#[repr(C, align(16))]
+pub struct FpuState {
+    pub data: [u8; 512],
+}
+
+impl FpuState {
+    pub const fn new() -> Self {
+        Self { data: [0; 512] }
+    }
+}
+
 /// Saved register state for a suspended task.
 ///
-/// Contains only the callee-saved registers plus the stack pointer.
-/// The System V AMD64 ABI requires callees to preserve rbx, rbp, and
-/// r12–r15; everything else is either caller-saved (handled by the
-/// compiler) or implicit (RIP is the return address on the stack).
+/// Contains the callee-saved registers, stack pointer, and a pointer to
+/// the FPU/SSE save area. The System V AMD64 ABI requires callees to
+/// preserve rbx, rbp, and r12–r15; everything else is either caller-saved
+/// (handled by the compiler) or implicit (RIP is the return address on
+/// the stack).
 ///
 /// # Layout
 ///
 /// `#[repr(C)]` ensures predictable field offsets for the assembly
 /// context switch routine:
 ///
-/// | Offset | Field |
-/// |--------|-------|
-/// | 0      | rsp   |
-/// | 8      | rbx   |
-/// | 16     | rbp   |
-/// | 24     | r12   |
-/// | 32     | r13   |
-/// | 40     | r14   |
-/// | 48     | r15   |
+/// | Offset | Field     |
+/// |--------|-----------|
+/// | 0      | rsp       |
+/// | 8      | rbx       |
+/// | 16     | rbp       |
+/// | 24     | r12       |
+/// | 32     | r13       |
+/// | 40     | r14       |
+/// | 48     | r15       |
+/// | 56     | fpu_state |
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct TaskContext {
@@ -56,10 +75,18 @@ pub struct TaskContext {
     pub r13: u64,
     pub r14: u64,
     pub r15: u64,
+    /// Pointer to the 512-byte FXSAVE area for this task's FPU/SSE state.
+    /// Heap-allocated per task, freed on drop. The switch assembly reads
+    /// this at offset 56 via `[rdi+56]` / `[rsi+56]`.
+    pub fpu_state: *mut FpuState,
 }
 
+// TaskContext must be Send because Task is stored in cross-core queues.
+unsafe impl Send for TaskContext {}
+unsafe impl Sync for TaskContext {}
+
 impl TaskContext {
-    /// A zeroed context — all registers set to 0.
+    /// A zeroed context — all registers set to 0, no FPU state.
     ///
     /// Used for the bootstrap task (whose real register values will be
     /// saved on the first context switch) and as the base for new tasks
@@ -73,6 +100,7 @@ impl TaskContext {
             r13: 0,
             r14: 0,
             r15: 0,
+            fpu_state: core::ptr::null_mut(),
         }
     }
 }

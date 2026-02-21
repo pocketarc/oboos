@@ -144,6 +144,14 @@ impl MemoryManager for X86_64 {
     fn unmap_page(virt: usize) {
         paging::unmap_page(virt);
     }
+
+    fn map_page_at(pml4_phys: usize, virt: usize, phys: usize, flags: PageFlags) {
+        paging::map_page_at(pml4_phys, virt, phys, flags);
+    }
+
+    fn unmap_page_at(pml4_phys: usize, virt: usize) {
+        paging::unmap_page_at(pml4_phys, virt);
+    }
 }
 
 impl ContextSwitch for X86_64 {

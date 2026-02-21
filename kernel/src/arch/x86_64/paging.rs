@@ -303,16 +303,16 @@ fn get_or_create_next_table(entry: &mut PageTableEntry) -> &'static mut PageTabl
     table
 }
 
-/// Walk the page table hierarchy for `virt`, allocating intermediate tables
-/// as needed. Returns the final PT (level-1 table) where the leaf entry
-/// for this virtual address lives.
+/// Walk the page table hierarchy starting from an explicit PML4, allocating
+/// intermediate tables as needed. Returns the final PT (level-1 table)
+/// where the leaf entry for this virtual address lives.
 ///
 /// # Panics
 ///
 /// Panics if a huge page (2 MiB or 1 GiB) is encountered — we don't
 /// support splitting or mapping those yet.
-fn walk_or_create(virt: usize) -> &'static mut PageTable {
-    let pml4 = table_at_phys(read_cr3());
+fn walk_or_create_at(pml4_phys: u64, virt: usize) -> &'static mut PageTable {
+    let pml4 = table_at_phys(pml4_phys);
     let pdpt_entry = &mut pml4.entries[pml4_index(virt)];
     let pdpt = get_or_create_next_table(pdpt_entry);
 
@@ -333,14 +333,15 @@ fn walk_or_create(virt: usize) -> &'static mut PageTable {
     get_or_create_next_table(pt_entry)
 }
 
-/// Walk the page table hierarchy for `virt` without allocating. Returns
-/// `None` if any intermediate table is missing (the address has never been
-/// mapped at any level).
-///
-/// Used by `unmap_page` — we don't want to create empty tables just to
-/// discover there's nothing to unmap.
-fn walk_existing(virt: usize) -> Option<&'static mut PageTable> {
-    let pml4 = table_at_phys(read_cr3());
+/// Walk the page table hierarchy for `virt` using the current CR3.
+fn walk_or_create(virt: usize) -> &'static mut PageTable {
+    walk_or_create_at(read_cr3(), virt)
+}
+
+/// Walk the page table hierarchy starting from an explicit PML4 without
+/// allocating. Returns `None` if any intermediate table is missing.
+fn walk_existing_at(pml4_phys: u64, virt: usize) -> Option<&'static mut PageTable> {
+    let pml4 = table_at_phys(pml4_phys);
     let pdpt_entry = pml4.entries[pml4_index(virt)];
     if !pdpt_entry.is_present() {
         return None;
@@ -359,6 +360,12 @@ fn walk_existing(virt: usize) -> Option<&'static mut PageTable> {
     }
 
     Some(table_at_phys(pt_entry.physical_addr()))
+}
+
+/// Walk the page table hierarchy for `virt` using the current CR3, without
+/// allocating. Returns `None` if any intermediate table is missing.
+fn walk_existing(virt: usize) -> Option<&'static mut PageTable> {
+    walk_existing_at(read_cr3(), virt)
 }
 
 // ————————————————————————————————————————————————————————————————————————————
@@ -454,6 +461,61 @@ pub fn unmap_page(virt: usize) {
 /// net before calling [`map_page`] (which panics on double-map).
 pub fn is_page_mapped(virt: usize) -> bool {
     walk_existing(virt)
+        .map(|pt| pt.entries[pt_index(virt)].is_present())
+        .unwrap_or(false)
+}
+
+/// Map a 4 KiB virtual page in a specific address space (explicit PML4).
+///
+/// Like [`map_page`], but operates on the given PML4 instead of the current
+/// CR3. Use this when mapping pages into a process's address space that may
+/// not be the currently active one.
+///
+/// # Panics
+///
+/// - If `virt` or `phys` are not page-aligned.
+/// - If the virtual address is already mapped in the target address space.
+pub fn map_page_at(pml4_phys: usize, virt: usize, phys: usize, flags: crate::platform::PageFlags) {
+    assert_eq!(virt % FRAME_SIZE, 0,
+        "map_page_at: virtual address {:#X} is not page-aligned", virt);
+    assert_eq!(phys % FRAME_SIZE, 0,
+        "map_page_at: physical address {:#X} is not page-aligned", phys);
+
+    let pt = walk_or_create_at(pml4_phys as u64, virt);
+    let idx = pt_index(virt);
+    let existing = pt.entries[idx];
+
+    assert!(!existing.is_present(),
+        "map_page_at: virtual address {:#X} is already mapped to {:#X}",
+        virt, existing.physical_addr());
+
+    let hw_flags = translate_flags(flags) | PageTableEntry::PRESENT;
+    pt.entries[idx] = PageTableEntry::new(phys as u64, hw_flags);
+}
+
+/// Unmap a 4 KiB virtual page in a specific address space (explicit PML4).
+///
+/// Like [`unmap_page`], but operates on the given PML4. Does NOT flush
+/// the TLB — the caller must handle TLB invalidation if this is the
+/// current CR3 or if other cores may have cached the mapping.
+pub fn unmap_page_at(pml4_phys: usize, virt: usize) {
+    assert_eq!(virt % FRAME_SIZE, 0,
+        "unmap_page_at: virtual address {:#X} is not page-aligned", virt);
+
+    let pt = walk_existing_at(pml4_phys as u64, virt)
+        .expect("unmap_page_at: no page table for address");
+    let idx = pt_index(virt);
+
+    assert!(pt.entries[idx].is_present(),
+        "unmap_page_at: virtual address {:#X} is not mapped", virt);
+
+    pt.entries[idx] = PageTableEntry::empty();
+}
+
+/// Check whether a virtual address has a present leaf mapping in a specific
+/// address space (explicit PML4).
+pub fn is_page_mapped_at(pml4_phys: usize, virt: usize) -> bool {
+    walk_existing_at(pml4_phys as u64, virt)
         .map(|pt| pt.entries[pt_index(virt)].is_present())
         .unwrap_or(false)
 }

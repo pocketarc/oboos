@@ -13,8 +13,10 @@
 //! This module does NOT include scheduling or context switching — those
 //! come in Phase 2b and 2c.
 
+use alloc::boxed::Box;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::arch::context::FpuState;
 use crate::arch::{self, TaskContext};
 use crate::memory::{self, FRAME_SIZE};
 use crate::platform::{MemoryManager, PageFlags};
@@ -111,10 +113,12 @@ impl Task {
     /// boot stack provided by the bootloader. The zeroed context will be
     /// filled with real register values on the first context switch.
     pub fn bootstrap() -> Self {
+        let mut context = TaskContext::zero();
+        context.fpu_state = Box::into_raw(Box::new(FpuState::new()));
         Self {
             id: TaskId(0),
             state: TaskState::Running,
-            context: TaskContext::zero(),
+            context,
             stack: None,
         }
     }
@@ -158,10 +162,11 @@ impl Task {
             core::ptr::write(tramp_ptr, arch::task_trampoline as *const () as u64);
         }
 
-        let context = TaskContext {
+        let mut context = TaskContext {
             rsp: (alloc.stack_top - INITIAL_FRAME_SLOTS * 8) as u64,
             ..TaskContext::zero()
         };
+        context.fpu_state = Box::into_raw(Box::new(FpuState::new()));
 
         Self {
             id,
@@ -180,6 +185,9 @@ impl Task {
 
 impl Drop for Task {
     fn drop(&mut self) {
+        if !self.context.fpu_state.is_null() {
+            unsafe { drop(Box::from_raw(self.context.fpu_state)); }
+        }
         if let Some(ref alloc) = self.stack {
             for i in 0..STACK_PAGES {
                 let virt = alloc.stack_bottom + i * FRAME_SIZE;

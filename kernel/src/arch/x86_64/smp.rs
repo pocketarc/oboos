@@ -131,6 +131,11 @@ static TLB_SHOOTDOWN_ADDR: AtomicU64 = AtomicU64::new(0);
 /// spins until this reaches 0.
 static TLB_SHOOTDOWN_PENDING: AtomicU32 = AtomicU32::new(0);
 
+/// Spinlock guarding the TLB shootdown protocol. Without this, two cores
+/// calling `tlb_shootdown` simultaneously would race on ADDR/PENDING,
+/// potentially invalidating the wrong page on some cores.
+static TLB_SHOOTDOWN_LOCK: AtomicBool = AtomicBool::new(false);
+
 // ————————————————————————————————————————————————————————————————————————————
 // Public API
 // ————————————————————————————————————————————————————————————————————————————
@@ -141,7 +146,17 @@ pub fn cpu_count() -> u32 {
 }
 
 /// Return the LAPIC ID for a given CPU index. Used for IPI targeting.
+///
+/// # Panics
+///
+/// Panics if `cpu_index` is out of bounds (`>= MAX_CPUS`).
 pub fn lapic_id_for_cpu(cpu_index: u32) -> u32 {
+    assert!(
+        (cpu_index as usize) < MAX_CPUS,
+        "lapic_id_for_cpu: cpu_index {} >= MAX_CPUS ({})",
+        cpu_index,
+        MAX_CPUS
+    );
     unsafe {
         let percpu = PER_CPU_DATA[cpu_index as usize].as_ptr();
         (*percpu).lapic_id
@@ -216,6 +231,14 @@ pub fn tlb_shootdown(virt: usize) {
         return;
     }
 
+    // Acquire the shootdown lock so concurrent callers serialize.
+    while TLB_SHOOTDOWN_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+
     let current = current_cpu();
 
     TLB_SHOOTDOWN_ADDR.store(virt as u64, Ordering::Release);
@@ -233,6 +256,8 @@ pub fn tlb_shootdown(virt: usize) {
     while TLB_SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
         core::hint::spin_loop();
     }
+
+    TLB_SHOOTDOWN_LOCK.store(false, Ordering::Release);
 }
 
 /// Handle a TLB shootdown IPI on the receiving core.
